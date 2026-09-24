@@ -609,7 +609,7 @@ pub fn attribute(fd: RawFd) -> Attribution {
 
     let purpose = purpose::classify(&chain);
     let signing_commit = matches!(purpose.kind, PurposeKind::CommitSigning);
-    let ctx = context::gather(&chain, purpose.repo_path.as_deref(), signing_commit);
+    let ctx = context::gather_bounded(chain.clone(), purpose.repo_path.clone(), signing_commit);
 
     Attribution {
         pid,

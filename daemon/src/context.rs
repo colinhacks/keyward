@@ -345,6 +345,27 @@ fn tidy_shortstat(s: &str) -> String {
     format!("{files}, +{ins} −{del}")
 }
 
+/// `gather` reads the caller's repository, and on macOS a read under ~/Documents can
+/// block inside open(2) for as long as a privacy consent prompt goes unanswered — a
+/// launchd daemon rebuilt with an ad-hoc signature is a new identity every time, so the
+/// prompt comes back after every build. Signing must not hang on it: run the reads on
+/// their own thread and give up after a bound, sending the card without git details.
+/// A thread stuck in open() is left to finish (or leak) on its own.
+pub fn gather_bounded(chain: Vec<ProcInfo>, repo_path: Option<String>, signing_commit: bool) -> Context {
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(gather(&chain, repo_path.as_deref(), signing_commit));
+    });
+    match rx.recv_timeout(BUDGET) {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("keywardd: context gathering exceeded {BUDGET:?}; is a Documents/Desktop consent prompt for keywardd unanswered?");
+            Context::default()
+        }
+    }
+}
+
 pub fn gather(chain: &[ProcInfo], repo_path: Option<&str>, signing_commit: bool) -> Context {
     let (env, env_from_pid, env_from) = env_from_chain(chain);
     let (declared, declared_from_pid) = declared_for(chain);
