@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "KeywardApp",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v15)],
     targets: [
         .executableTarget(
             name: "KeywardApp",

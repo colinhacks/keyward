@@ -266,7 +266,7 @@ xattr -dr com.apple.quarantine /Applications/Keyward.app
 If that trade is not one you want to make, build it yourself — the toolchain is
 the same either way.
 
-Requires macOS 14+ on Apple Silicon; the Secure Enclave key has nowhere to live
+Requires macOS 15+ on Apple Silicon; the Secure Enclave key has nowhere to live
 otherwise.
 
 ### First run

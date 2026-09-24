@@ -5,6 +5,10 @@ import SwiftUI
 /// closed, and a view's onAppear fires in none of those cases.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
+        // Background agent: no Dock icon, and a launch (or an install script's
+        // relaunch) never steals focus. LSUIElement in Info.plist says the same
+        // to Launch Services; this covers a binary run outside the bundle.
+        NSApp.setActivationPolicy(.accessory)
         ApprovalServer.shared.start()
         AgentInstaller.installIfNeeded()
     }
@@ -15,7 +19,14 @@ struct KeywardApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var store = EventStore()
 
+    // The menu bar item is the primary scene, so launch opens nothing: the card
+    // panel is what the app is for, and it is raised by the daemon, not by a
+    // window. The activity window still exists and opens from the menu.
     var body: some Scene {
+        MenuBarExtra("Keyward", systemImage: "key.horizontal.fill") {
+            MenuBarContent().environmentObject(store)
+        }
+
         Window("Keyward", id: "main") {
             ContentView()
                 .environmentObject(store)
@@ -25,10 +36,9 @@ struct KeywardApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
-
-        MenuBarExtra("Keyward", systemImage: "key.horizontal.fill") {
-            MenuBarContent().environmentObject(store)
-        }
+        // Scene order alone does not stop a Window scene from opening at
+        // launch; this does (macOS 15+).
+        .defaultLaunchBehavior(.suppressed)
     }
 }
 
