@@ -102,12 +102,23 @@ impl Default for Config {
     }
 }
 
+/// Expand a leading `~/` the way a shell would. The README writes every path with `~`, and launchd
+/// starts the daemon with cwd `/`, so an unexpanded `~` bound a socket under a literal directory
+/// named `~` when run from a shell and failed with ENOENT under launchd.
+fn expand_home(p: &str) -> String {
+    match p.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", home()),
+        None if p == "~" => home(),
+        None => p.to_string(),
+    }
+}
+
 fn load_config(path: Option<&str>) -> Config {
     let p = path
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{}/.config/keyward/config.json", home())));
-    match std::fs::read_to_string(&p) {
-        Ok(s) => match serde_json::from_str(&s) {
+    let mut cfg = match std::fs::read_to_string(&p) {
+        Ok(s) => match serde_json::from_str::<Config>(&s) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("keywardd: bad config {}: {e} — using defaults", p.display());
@@ -115,7 +126,16 @@ fn load_config(path: Option<&str>) -> Config {
             }
         },
         Err(_) => Config::default(),
+    };
+    cfg.listen = expand_home(&cfg.listen);
+    cfg.log = expand_home(&cfg.log);
+    for u in &mut cfg.upstreams {
+        u.path = expand_home(&u.path);
     }
+    if let Some(k) = cfg.enclave_key.as_mut() {
+        *k = expand_home(k);
+    }
+    cfg
 }
 
 /// Bind the listen socket, clearing a stale one but never stealing a live one.
