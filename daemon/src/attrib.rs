@@ -263,9 +263,155 @@ pub fn proc_name(pid: i32) -> Option<String> {
     cstr_field(&info.pbi_name).or_else(|| cstr_field(&info.pbi_comm))
 }
 
-/// Full argv of a process, via KERN_PROCARGS2.
+/// Full argv of a process, via KERN_PROCARGS2, with credentials taken out.
 pub fn proc_args(pid: i32) -> Vec<String> {
-    proc_argv_env(pid).0
+    proc_argv_env(pid).0.iter().map(|a| redact(a)).collect()
+}
+
+const REDACTED: &str = "[redacted]";
+
+/// Credentials that ride in on a command line.
+///
+/// Everything an ancestor's argv carries is written to the event log and sent to the app, and a
+/// launcher that hands a child an MCP config or a registry URL puts a live token right there. So
+/// redaction happens at capture: no later surface has to remember, and nothing downstream can
+/// leak what was never kept. Over-redaction is the safe direction here — argv is context for a
+/// human, never something we parse back.
+pub fn redact(arg: &str) -> String {
+    let b = arg.as_bytes();
+    let mut out = String::with_capacity(arg.len());
+    let mut i = 0;
+    while i < b.len() {
+        // `Authorization: Bearer <token>` — the scheme stays, the credential goes.
+        if let Some(after) = scheme_at(b, i) {
+            let mut v = after;
+            while v < b.len() && b[v] == b' ' {
+                v += 1;
+            }
+            let end = value_end(b, v, b"\"'}");
+            if end > v {
+                out.push_str(&arg[i..v]);
+                out.push_str(REDACTED);
+                i = end;
+                continue;
+            }
+        }
+        // `token=…`, `//registry.npmjs.org/:_authToken=…`, `password=…`
+        if b[i] == b'=' && secret_key_before(b, i) {
+            out.push('=');
+            let mut v = i + 1;
+            if v < b.len() && (b[v] == b'"' || b[v] == b'\'') {
+                out.push(b[v] as char);
+                v += 1;
+            }
+            let end = value_end(b, v, b"&\"'");
+            if end > v {
+                out.push_str(REDACTED);
+            }
+            i = end;
+            continue;
+        }
+        // Credentials that identify themselves: `ghp_…`, `napi_…`, `AKIA…`.
+        if word_start(b, i) {
+            if let Some(end) = token_at(b, i) {
+                out.push_str(REDACTED);
+                i = end;
+                continue;
+            }
+        }
+        let start = i;
+        i += 1;
+        while i < b.len() && !arg.is_char_boundary(i) {
+            i += 1;
+        }
+        out.push_str(&arg[start..i]);
+    }
+    out
+}
+
+fn is_tokenish(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// A credential never starts in the middle of a word, so `task_…` is not a `sk_` token.
+fn word_start(b: &[u8], i: usize) -> bool {
+    i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
+}
+
+fn scheme_at(b: &[u8], i: usize) -> Option<usize> {
+    for s in [b"bearer ".as_slice(), b"basic ".as_slice()] {
+        let end = i + s.len();
+        if end <= b.len() && b[i..end].eq_ignore_ascii_case(s) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// A credential runs to the first whitespace or structural delimiter.
+fn value_end(b: &[u8], mut i: usize, delims: &[u8]) -> usize {
+    while i < b.len() && !b[i].is_ascii_whitespace() && !delims.contains(&b[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Matched by suffix, so `_authToken`, `npm_token` and `--api_key` all land.
+fn secret_key_before(b: &[u8], eq: usize) -> bool {
+    let mut s = eq;
+    while s > 0 && is_tokenish(b[s - 1]) {
+        s -= 1;
+    }
+    if s == eq {
+        return false;
+    }
+    let key = String::from_utf8_lossy(&b[s..eq]).to_ascii_lowercase();
+    ["token", "password", "secret", "api_key", "apikey"]
+        .iter()
+        .any(|k| key.ends_with(k))
+}
+
+/// Vendor-prefixed tokens, longest prefix first so `github_pat_` is not read as a bare word.
+const TOKEN_PREFIXES: &[&str] = &[
+    "github_pat_",
+    "npm_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "napi_",
+    "sk_",
+    "xoxa_",
+    "xoxb_",
+    "xoxp_",
+    "xoxr_",
+];
+
+fn token_at(b: &[u8], i: usize) -> Option<usize> {
+    for p in TOKEN_PREFIXES {
+        let end = i + p.len();
+        if end <= b.len() && &b[i..end] == p.as_bytes() {
+            let mut j = end;
+            while j < b.len() && is_tokenish(b[j]) {
+                j += 1;
+            }
+            if j - end >= 8 {
+                return Some(j);
+            }
+        }
+    }
+    // AWS access key ids carry no separator: AKIA + 16 uppercase alphanumerics.
+    if i + 20 <= b.len() && &b[i..i + 4] == b"AKIA" {
+        let mut j = i + 4;
+        while j < b.len() && (b[j].is_ascii_digit() || b[j].is_ascii_uppercase()) {
+            j += 1;
+        }
+        if j - i >= 20 {
+            return Some(j);
+        }
+    }
+    None
 }
 
 /// argv and environment of a process.
@@ -474,5 +620,59 @@ pub fn attribute(fd: RawFd) -> Attribution {
         destination,
         purpose,
         context: ctx,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    // Every credential below is invented for the test.
+
+    #[test]
+    fn an_authorization_header_keeps_its_scheme_and_loses_its_token() {
+        let arg = r#"{"headers":{"Authorization":"Bearer napi_FAKE0000000000000000"}}"#;
+        assert_eq!(
+            redact(arg),
+            r#"{"headers":{"Authorization":"Bearer [redacted]"}}"#
+        );
+        assert_eq!(redact("Basic ZmFrZTpmYWtl"), "Basic [redacted]");
+    }
+
+    #[test]
+    fn a_credential_query_or_npmrc_field_loses_its_value_and_nothing_else() {
+        assert_eq!(
+            redact("//registry.example.com/:_authToken=FAKEVALUE123"),
+            "//registry.example.com/:_authToken=[redacted]"
+        );
+        assert_eq!(
+            redact("https://x.example/?api_key=FAKE123&next=keep"),
+            "https://x.example/?api_key=[redacted]&next=keep"
+        );
+        assert_eq!(redact("--password=\"FAKEpw\""), "--password=\"[redacted]\"");
+        assert_eq!(redact("PGPASSWORD="), "PGPASSWORD=");
+    }
+
+    #[test]
+    fn self_identifying_tokens_go_wherever_they_appear() {
+        assert_eq!(redact("ghp_FAKE12345678"), "[redacted]");
+        assert_eq!(redact("--key github_pat_FAKE1234abcd"), "--key [redacted]");
+        assert_eq!(redact("AKIAFAKE000000000000"), "[redacted]");
+        assert_eq!(redact("xoxb_FAKE12345678,next"), "[redacted],next");
+    }
+
+    /// The cost of getting this wrong is a card that says nothing, so ordinary
+    /// argv has to survive intact — including words that merely end in a prefix.
+    #[test]
+    fn ordinary_arguments_are_untouched() {
+        for arg in [
+            "git push origin main",
+            "/Users/someone/.frizz/server-releases/a1b2c3/server.mjs",
+            "task_manager --tokens 4",
+            "ssh git@github.com git-receive-pack 'owner/repo.git'",
+            "--reason Résumé · café",
+        ] {
+            assert_eq!(redact(arg), arg, "redact() mangled {arg:?}");
+        }
     }
 }

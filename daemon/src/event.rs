@@ -4,6 +4,9 @@ use crate::attrib::Attribution;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+// The log holds argv and working directories; it is created 0600, never the
+// 0644 the default umask would give it.
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,6 +77,7 @@ impl Log {
             *guard = OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o600)
                 .open(&self.path)
                 .ok();
         }
@@ -88,6 +92,7 @@ impl Log {
                     *guard = OpenOptions::new()
                         .create(true)
                         .append(true)
+                        .mode(0o600)
                         .open(&self.path)
                         .ok();
                 }
