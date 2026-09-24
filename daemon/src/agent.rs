@@ -49,6 +49,11 @@ pub struct Ctx {
     /// Where the last approval was granted, and when. The reuse window only
     /// covers further requests from the same place.
     pub last_approved: Mutex<Option<(Scope, Instant)>>,
+    /// Every connection runs on its own thread, and two Touch ID prompts at once
+    /// cancel each other ("Canceled by another authentication"), so signatures
+    /// take turns: the second request waits for the first prompt to finish, and
+    /// if the first approval covers its scope it then signs without a prompt.
+    pub sign_gate: Mutex<()>,
 }
 
 /// The blast radius of one Touch ID approval.
@@ -290,6 +295,7 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
             // enclave build a fresh LAContext *and* drop the cached one — so the
             // next in-scope request cannot inherit an authentication the user
             // granted somewhere else.
+            let _turn = lock(&ctx.sign_gate);
             let scope = scope_of(who);
             let reused = {
                 let last = lock(&ctx.last_approved);

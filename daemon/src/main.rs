@@ -322,6 +322,7 @@ fn main() {
         touch_id_reuse_secs: cfg.touch_id_reuse_secs,
         sheet_reason: cfg.sheet_reason.clone(),
         last_approved: Mutex::new(None),
+        sign_gate: Mutex::new(()),
     });
 
     eprintln!(
