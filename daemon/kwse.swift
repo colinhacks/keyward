@@ -30,11 +30,15 @@ private final class ContextCache {
     private var ctx: LAContext?
     private var born = Date.distantPast
 
-    func take(reuse: Double) -> LAContext {
+    /// Returns the context and whether it is new. A new context has to be
+    /// authenticated explicitly before it signs: the prompt the enclave raises on
+    /// its own does not start the reuse clock, so the next request in the window
+    /// prompted a second time and only the third was silent.
+    func take(reuse: Double) -> (LAContext, Bool) {
         lock.lock()
         defer { lock.unlock() }
         if reuse > 0, let c = ctx, Date().timeIntervalSince(born) < reuse {
-            return c
+            return (c, false)
         }
         let c = LAContext()
         if reuse > 0 {
@@ -45,7 +49,14 @@ private final class ContextCache {
         } else {
             ctx = nil
         }
-        return c
+        return (c, true)
+    }
+
+    /// Drop the cached context so the next request authenticates again.
+    func forget() {
+        lock.lock()
+        ctx = nil
+        lock.unlock()
     }
 }
 
@@ -76,11 +87,32 @@ public func kwse_sign(_ blob: UnsafePointer<UInt8>, _ blobLen: Int,
     let d = Data(bytes: blob, count: blobLen)
     // Consecutive signatures within the window share one authentication, so a
     // loop over the fleet asks once rather than once per host.
-    let ctx = ContextCache.shared.take(reuse: reuseSeconds)
-    if let reason, let text = String(validatingUTF8: reason), !text.isEmpty {
+    let (ctx, fresh) = ContextCache.shared.take(reuse: reuseSeconds)
+    var text = ""
+    if let reason, let t = String(validatingUTF8: reason), !t.isEmpty {
         // This is the whole point: Keyward writes the Touch ID prompt, so it can
         // name the commit or the host instead of saying "a request from launchd".
-        ctx.localizedReason = text
+        ctx.localizedReason = t
+        text = t
+    }
+    if fresh {
+        // One explicit authentication, which the reuse window then honours; the
+        // signature below rides it without a second prompt. deviceOwnerAuthentication
+        // matches the key's presence policy (Touch ID, password as fallback).
+        let done = DispatchSemaphore(value: 0)
+        var ok = false
+        var why: Error?
+        ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: text.isEmpty ? "sign an SSH request" : text) { success, error in
+            ok = success
+            why = error
+            done.signal()
+        }
+        done.wait()
+        if !ok {
+            ContextCache.shared.forget()
+            FileHandle.standardError.write("keywardd: authentication failed: \(why.map { String(describing: $0) } ?? "unknown")\n".data(using: .utf8)!)
+            return -3
+        }
     }
     let k: SecureEnclave.P256.Signing.PrivateKey
     do {
