@@ -53,19 +53,23 @@ struct Show<'a> {
 
 /// A name a human recognises for a link in the chain. `node` says nothing when it is the frizz
 /// server or a Claude session; the path and arguments say which.
+///
+/// Only the executable and the entry-point argument are allowed to decide what a process *is*.
+/// Matching the whole joined argv labelled the Claude session `frizz server` too, because its
+/// `--mcp-config` argument names the server's path — and the card then collapsed two identical
+/// consecutive links into one, losing `claude` from the chain entirely.
 fn display_name(p: &crate::attrib::ProcInfo) -> Option<String> {
     let name = p.name.clone()?;
-    let joined = p.args.join(" ");
-    if joined.contains(".frizz/server-releases") || joined.contains("frizz-server") {
-        return Some("frizz server".into());
-    }
-    if name == "node" && (joined.contains("/claude") || joined.contains("claude-code")) {
+    if p.path.as_deref().map_or(false, |path| path.ends_with("/claude")) {
         return Some("claude".into());
     }
-    if let Some(path) = &p.path {
-        if path.ends_with("/claude") {
-            return Some("claude".into());
-        }
+    // `node /Users/<user>/.frizz/server-releases/<hash>/<entry>` — argv[1] is the entry point.
+    let head = p.path.iter().chain(p.args.iter().take(2));
+    if head.clone().any(|s| s.contains(".frizz/server-releases") || s.contains("frizz-server")) {
+        return Some("frizz server".into());
+    }
+    if name == "node" && head.clone().any(|s| s.contains("/claude") || s.contains("claude-code")) {
+        return Some("claude".into());
     }
     Some(name)
 }
@@ -204,4 +208,51 @@ pub fn show(who: &Attribution, headline: &str, key: Option<&str>, fp: Option<&st
     let _ = reader.read_line(&mut ack);
 
     Card(Some(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_name;
+    use crate::attrib::ProcInfo;
+
+    fn proc(name: &str, path: &str, args: &[&str]) -> ProcInfo {
+        ProcInfo {
+            pid: 1,
+            name: Some(name.into()),
+            path: Some(path.into()),
+            cwd: None,
+            args: args.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn frizz_server_is_named_by_its_entry_point() {
+        let p = proc(
+            "node",
+            "/Users/someone/.local/share/nvm/v24.0.0/bin/node",
+            &["node", "/Users/someone/.frizz/server-releases/a1b2c3/server.mjs"],
+        );
+        assert_eq!(display_name(&p).as_deref(), Some("frizz server"));
+    }
+
+    /// The regression: the session's MCP config names the server, and a whole-argv
+    /// match turned the Claude link into a second `frizz server`.
+    #[test]
+    fn claude_mentioning_the_server_is_still_claude() {
+        let p = proc(
+            "claude",
+            "/Users/someone/.frizz/runtimes/claude/2.1.277/claude",
+            &[
+                "claude",
+                "--mcp-config",
+                "{\"frizz\":{\"command\":\"node\",\"args\":[\"/Users/someone/.frizz/server-releases/a1b2c3/mcp.mjs\"]}}",
+            ],
+        );
+        assert_eq!(display_name(&p).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn ordinary_processes_keep_their_own_name() {
+        assert_eq!(display_name(&proc("zsh", "/bin/zsh", &["-zsh"])).as_deref(), Some("zsh"));
+    }
 }
