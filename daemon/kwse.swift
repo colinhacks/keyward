@@ -82,8 +82,21 @@ public func kwse_sign(_ blob: UnsafePointer<UInt8>, _ blobLen: Int,
         // name the commit or the host instead of saying "a request from launchd".
         ctx.localizedReason = text
     }
-    guard let k = try? SecureEnclave.P256.Signing.PrivateKey(
-            dataRepresentation: d, authenticationContext: ctx) else { return -1 }
-    guard let sig = try? k.signature(for: Data(bytes: msg, count: msgLen)) else { return -3 }
+    let k: SecureEnclave.P256.Signing.PrivateKey
+    do {
+        k = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: d, authenticationContext: ctx)
+    } catch {
+        FileHandle.standardError.write("keywardd: enclave key load failed: \(error)\n".data(using: .utf8)!)
+        return -1
+    }
+    let sig: P256.Signing.ECDSASignature
+    do {
+        sig = try k.signature(for: Data(bytes: msg, count: msgLen))
+    } catch {
+        // The daemon maps this to "declined or authentication failed"; the log keeps the
+        // real reason, which is what tells a stale grant from a user's cancel.
+        FileHandle.standardError.write("keywardd: enclave signature failed: \(error)\n".data(using: .utf8)!)
+        return -3
+    }
     return store(sig.rawRepresentation, buf, cap)   // r||s, 64 bytes
 }
