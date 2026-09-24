@@ -34,6 +34,11 @@ private final class ContextCache {
     /// authenticated explicitly before it signs: the prompt the enclave raises on
     /// its own does not start the reuse clock, so the next request in the window
     /// prompted a second time and only the third was silent.
+    ///
+    /// The context is cached whenever a window exists, including on the request
+    /// that opens it: an approval given outside every scope used to build a
+    /// context that was never kept, so the very next in-scope request prompted
+    /// again. The daemon calls `forget` first when the request is out of scope.
     func take(reuse: Double) -> (LAContext, Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -105,6 +110,12 @@ public func kwse_keychain_store(_ blob: UnsafePointer<UInt8>, _ len: Int, _ forc
         return -1
     }
     return 0
+}
+
+/// Drop the cached authentication: the next signature prompts whatever the window.
+@_cdecl("kwse_forget")
+public func kwse_forget() {
+    ContextCache.shared.forget()
 }
 
 @_cdecl("kwse_available")

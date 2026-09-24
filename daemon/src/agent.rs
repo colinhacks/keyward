@@ -291,17 +291,21 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
             let reason = sheet_reason(who, &ctx.sheet_reason);
             let fp = fingerprint(&blob);
 
-            // Outside the scope of the last approval we pass 0, which makes the
-            // enclave build a fresh LAContext *and* drop the cached one — so the
-            // next in-scope request cannot inherit an authentication the user
-            // granted somewhere else.
+            // Outside the scope of the last approval the cached authentication is
+            // dropped first, so this request prompts and the next in-scope one
+            // cannot inherit an approval the user granted somewhere else. The
+            // window itself is always passed: the prompt this request raises is
+            // what opens the window, so its context has to be the one kept.
             let _turn = lock(&ctx.sign_gate);
             let scope = scope_of(who);
             let reused = {
                 let last = lock(&ctx.last_approved);
                 reuse_covers(last.as_ref(), &scope, ctx.touch_id_reuse_secs, Instant::now())
             };
-            let window = if reused { ctx.touch_id_reuse_secs } else { 0.0 };
+            if !reused {
+                e.forget();
+            }
+            let window = ctx.touch_id_reuse_secs;
 
             let card = crate::ui::show(who, &headline, Some(&e.comment), Some(&fp));
             let signed = e.sign(&data, &reason, window);

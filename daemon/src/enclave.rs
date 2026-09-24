@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 extern "C" {
     fn kwse_available() -> i32;
+    fn kwse_forget();
     fn kwse_generate(policy: i32, buf: *mut u8, cap: usize) -> isize;
     fn kwse_public(blob: *const u8, blob_len: usize, buf: *mut u8, cap: usize) -> isize;
     fn kwse_keychain_load(buf: *mut u8, cap: usize) -> isize;
@@ -171,6 +172,11 @@ impl Enclave {
     ///
     /// CryptoKit hashes with SHA-256 internally, which is what
     /// `ecdsa-sha2-nistp256` requires, and returns a raw r||s pair.
+    /// Forget the cached authentication, so the next `sign` prompts even inside a window.
+    pub fn forget(&self) {
+        unsafe { kwse_forget() }
+    }
+
     pub fn sign(&self, data: &[u8], reason: &str, reuse_secs: f64) -> Result<Vec<u8>, String> {
         let c_reason = CString::new(reason).unwrap_or_else(|_| CString::new("").unwrap());
         let mut sig = vec![0u8; 256];
