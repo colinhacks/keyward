@@ -29,6 +29,7 @@ const ENV_ALLOW: &[&str] = &[
     "CLAUDE_CODE_HOST_SESSION_ID",
     "CLAUDE_AGENT_SDK_VERSION",
     "CLAUDE_CODE_SUBSCRIPTION_TYPE",
+    "FRIZZ_THREAD",
     "OTEL_SERVICE_NAME",
     "OTEL_RESOURCE_ATTRIBUTES",
     "BAGGAGE",
@@ -125,6 +126,25 @@ fn session_title(id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The frizz thread a worker is running, when there is one.
+///
+/// A frizz worker has no Claude Code session record to resolve a title from, but it does carry
+/// the thread slug in its environment — which is the same answer to "which conversation asked
+/// for the key". The variable can sit on a different link of the chain than the one whose
+/// environment we captured, so fall back to walking the rest.
+fn frizz_thread(chain: &[ProcInfo], env: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(v) = env.get("FRIZZ_THREAD").filter(|v| !v.is_empty()) {
+        return Some(v.clone());
+    }
+    chain.iter().find_map(|p| {
+        proc_argv_env(p.pid)
+            .1
+            .into_iter()
+            .find(|(k, v)| k == "FRIZZ_THREAD" && !v.is_empty())
+            .map(|(_, v)| truncate(&v, 90))
+    })
 }
 
 fn context_dir() -> PathBuf {
@@ -342,7 +362,8 @@ pub fn gather(chain: &[ProcInfo], repo_path: Option<&str>, signing_commit: bool)
     }
     let title = env
         .get("CLAUDE_CODE_HOST_SESSION_ID")
-        .and_then(|id| session_title(id));
+        .and_then(|id| session_title(id))
+        .or_else(|| frizz_thread(chain, &env));
     Context {
         env,
         env_from_pid,
