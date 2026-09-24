@@ -17,6 +17,8 @@ final class ApprovalPanel {
     private var pending: DispatchWorkItem?
     private var ctx: PendingSignature?
     private var sheet: CGRect = ApprovalPanel.remembered
+    /// Whether the commit list is unfolded. Reset for every new card.
+    private var expanded = false
 
     private static let defaultsKey = "lastAuthSheetRect"
 
@@ -45,6 +47,7 @@ final class ApprovalPanel {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.ctx = c
+            self.expanded = false
             self.sheet = Self.remembered
             self.rebuild()
             self.startPolling()
@@ -68,7 +71,7 @@ final class ApprovalPanel {
         let w = CardMetrics.pad + detail + CardMetrics.gap + s.width + CardMetrics.pad
         // The card grows downward for a long script; the slot stays pinned at
         // the top of its column so the sheet still lands in it.
-        let content = ctx.map { ApprovalView.preferredHeight(for: $0, sheetHeight: s.height) }
+        let content = ctx.map { ApprovalView.preferredHeight(for: $0, sheetHeight: s.height, expanded: expanded) }
                    ?? s.height
         let h = CardMetrics.pad * 2 + content
         // Keep the card on screen when a wide script pushes it leftward.
@@ -85,7 +88,13 @@ final class ApprovalPanel {
         let screenH = CGDisplayBounds(CGMainDisplayID()).height
         let origin = NSPoint(x: card.minX, y: screenH - card.maxY)
 
-        let view = NSHostingView(rootView: ApprovalView(ctx: c, sheetSize: sheet.size))
+        let view = NSHostingView(rootView: ApprovalView(ctx: c, sheetSize: sheet.size, expanded: expanded, onToggle: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.expanded.toggle()
+                self.rebuild()
+            }
+        }))
         view.frame = NSRect(origin: .zero, size: card.size)
 
         if let p = panel {
@@ -101,7 +110,10 @@ final class ApprovalPanel {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = false
-        p.ignoresMouseEvents = true      // never intercept a click meant for the sheet
+        // The sheet sits at level 1000, far above this panel, so a click on it never reaches
+        // us; the panel takes clicks only where the sheet is not, which is what lets the
+        // commit list fold and unfold.
+        p.ignoresMouseEvents = false
         p.level = NSWindow.Level(rawValue: 20)   // above windows, far below the sheet's 1000
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         p.orderFrontRegardless()

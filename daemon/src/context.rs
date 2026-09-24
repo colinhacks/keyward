@@ -60,6 +60,22 @@ pub struct GitContext {
     pub remote: Option<String>,
     /// Subject line of the message being signed.
     pub subject: Option<String>,
+    /// For a push: the remote named on the command line (or the branch's upstream) and its URL.
+    #[serde(default)]
+    pub push_remote: Option<String>,
+    #[serde(default)]
+    pub push_remote_url: Option<String>,
+    /// For a push: what is about to leave — `%h %s` per commit, newest first, capped.
+    #[serde(default)]
+    pub commits: Vec<String>,
+    #[serde(default)]
+    pub commit_count: Option<u32>,
+    /// For a push: `git diff --shortstat` of the same range, e.g. "3 files changed, +47 −47".
+    #[serde(default)]
+    pub stat: Option<String>,
+    /// For a push: the upstream ref the range was computed against, None when the branch is new.
+    #[serde(default)]
+    pub upstream: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -208,13 +224,122 @@ pub fn git_context(repo_path: &str, want_message: bool) -> Option<GitContext> {
         branch,
         remote: origin_url(&gitdir),
         subject,
+        ..GitContext::default()
     })
+}
+
+/// Run git in a repository with a bounded, quiet environment. Everything here is read-only.
+fn git_out(repo: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// The `git push` in the chain, if any: (remote, refspec) as given on the command line.
+fn push_args(chain: &[ProcInfo]) -> Option<(Option<String>, Option<String>)> {
+    let git = chain.iter().find(|p| p.name.as_deref() == Some("git"))?;
+    let i = git.args.iter().position(|a| a == "push")?;
+    let mut positional: Vec<String> = Vec::new();
+    let mut skip = false;
+    for a in &git.args[i + 1..] {
+        if skip { skip = false; continue; }
+        if a == "--" { continue; }
+        if a.starts_with('-') {
+            // Options that take a separate argument; everything else is a flag.
+            if matches!(a.as_str(), "-o" | "--push-option" | "--receive-pack" | "--exec" | "--repo") { skip = true; }
+            continue;
+        }
+        positional.push(a.clone());
+    }
+    Some((positional.first().cloned(), positional.get(1).cloned()))
+}
+
+/// What a push is about to send: commits and a shortstat for `upstream..src`.
+///
+/// The range is resolved the way git will: an explicit remote plus refspec source, else the
+/// branch's configured upstream. A branch with no upstream yet is reported as new, with its
+/// most recent commits, because the whole history would be noise.
+fn push_summary(repo: &str, branch: Option<&str>, remote: Option<&str>, refspec: Option<&str>) -> GitContext {
+    let mut g = GitContext::default();
+    let src: String = refspec
+        .and_then(|r| r.split(':').next())
+        .map(|s| s.trim_start_matches('+').to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| branch.map(str::to_string))
+        .unwrap_or_else(|| "HEAD".to_string());
+    let src_short = src.trim_start_matches("refs/heads/").to_string();
+    let remote_name: Option<String> = remote.map(str::to_string).or_else(|| {
+        git_out(repo, &["config", "--get", &format!("branch.{src_short}.remote")])
+    });
+    g.push_remote = remote_name.clone();
+    if let Some(r) = &remote_name {
+        g.push_remote_url = git_out(repo, &["remote", "get-url", r]);
+    }
+    let upstream = remote_name.as_ref().and_then(|r| {
+        let candidate = format!("refs/remotes/{r}/{src_short}");
+        git_out(repo, &["rev-parse", "--verify", "--quiet", &candidate]).map(|_| format!("{r}/{src_short}"))
+    });
+    let (range, count_range) = match &upstream {
+        Some(u) => (format!("{u}..{src}"), format!("{u}..{src}")),
+        None => (src.clone(), src.clone()),
+    };
+    g.upstream = upstream.clone();
+    g.commit_count = git_out(repo, &["rev-list", "--count", &count_range]).and_then(|s| s.parse().ok());
+    if let Some(list) = git_out(repo, &["log", "--format=%h %s", "-n", "12", &range]) {
+        g.commits = list.lines().map(|l| truncate(l, 120)).collect();
+    }
+    if let Some(u) = &upstream {
+        if let Some(s) = git_out(repo, &["diff", "--shortstat", &format!("{u}..{src}")]) {
+            g.stat = Some(tidy_shortstat(&s));
+        }
+    }
+    g
+}
+
+/// " 3 files changed, 47 insertions(+), 47 deletions(-)" -> "3 files changed, +47 −47".
+fn tidy_shortstat(s: &str) -> String {
+    let mut files = String::new();
+    let mut ins = "0".to_string();
+    let mut del = "0".to_string();
+    for part in s.split(',') {
+        let p = part.trim();
+        if p.contains("file") {
+            files = p.to_string();
+        } else if p.contains("insertion") {
+            ins = p.split_whitespace().next().unwrap_or("0").to_string();
+        } else if p.contains("deletion") {
+            del = p.split_whitespace().next().unwrap_or("0").to_string();
+        }
+    }
+    format!("{files}, +{ins} −{del}")
 }
 
 pub fn gather(chain: &[ProcInfo], repo_path: Option<&str>, signing_commit: bool) -> Context {
     let (env, env_from_pid, env_from) = env_from_chain(chain);
     let (declared, declared_from_pid) = declared_for(chain);
-    let git = repo_path.and_then(|r| git_context(r, signing_commit));
+    let mut git = repo_path.and_then(|r| git_context(r, signing_commit));
+    if let (Some(repo), Some((remote, refspec))) = (repo_path, push_args(chain)) {
+        let branch = git.as_ref().and_then(|g| g.branch.clone());
+        let p = push_summary(repo, branch.as_deref(), remote.as_deref(), refspec.as_deref());
+        let g = git.get_or_insert_with(GitContext::default);
+        g.push_remote = p.push_remote;
+        g.push_remote_url = p.push_remote_url;
+        g.commits = p.commits;
+        g.commit_count = p.commit_count;
+        g.stat = p.stat;
+        g.upstream = p.upstream;
+    }
     let title = env
         .get("CLAUDE_CODE_HOST_SESSION_ID")
         .and_then(|id| session_title(id));

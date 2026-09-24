@@ -39,6 +39,42 @@ struct Show<'a> {
     script: bool,
     chain: Vec<String>,
     session: Option<String>,
+    /// Working directory of the git (or caller) process, with $HOME shortened to ~.
+    directory: Option<String>,
+    /// "origin = git@github.com:owner/repo.git" for a push.
+    remote: Option<String>,
+    /// For a push: the commits about to leave, newest first, and the shortstat.
+    commits: Vec<String>,
+    commit_count: Option<u32>,
+    stat: Option<String>,
+    /// For a push: the remote-tracking ref the range was computed against; None means a new branch.
+    upstream: Option<String>,
+}
+
+/// A name a human recognises for a link in the chain. `node` says nothing when it is the frizz
+/// server or a Claude session; the path and arguments say which.
+fn display_name(p: &crate::attrib::ProcInfo) -> Option<String> {
+    let name = p.name.clone()?;
+    let joined = p.args.join(" ");
+    if joined.contains(".frizz/server-releases") || joined.contains("frizz-server") {
+        return Some("frizz server".into());
+    }
+    if name == "node" && (joined.contains("/claude") || joined.contains("claude-code")) {
+        return Some("claude".into());
+    }
+    if let Some(path) = &p.path {
+        if path.ends_with("/claude") {
+            return Some("claude".into());
+        }
+    }
+    Some(name)
+}
+
+fn short_home(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if path.starts_with(&h) => format!("~{}", &path[h.len()..]),
+        _ => path.to_string(),
+    }
 }
 
 fn socket_path() -> PathBuf {
@@ -124,8 +160,23 @@ pub fn show(who: &Attribution, headline: &str, key: Option<&str>, fp: Option<&st
             .ancestry
             .iter()
             .rev()
-            .filter_map(|p| p.name.clone())
+            .filter_map(display_name)
             .collect(),
+        directory: who
+            .purpose
+            .repo_path
+            .clone()
+            .or_else(|| who.process.as_ref().and_then(|p| p.cwd.clone()))
+            .map(|d| short_home(&d)),
+        remote: git.and_then(|g| match (&g.push_remote, &g.push_remote_url) {
+            (Some(n), Some(url)) => Some(format!("{n} = {url}")),
+            (Some(n), None) => Some(n.clone()),
+            (None, _) => None,
+        }),
+        commits: git.map(|g| g.commits.clone()).unwrap_or_default(),
+        commit_count: git.and_then(|g| g.commit_count),
+        stat: git.and_then(|g| g.stat.clone()),
+        upstream: git.and_then(|g| g.upstream.clone()),
         // The title if we could resolve it, the raw id only as a last resort.
         session: who
             .context
