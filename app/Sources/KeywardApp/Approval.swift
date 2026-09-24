@@ -124,6 +124,8 @@ struct ApprovalView: View {
         let value: String
         var mono: Bool = true
         var lines: Int = 1
+        /// Shown as a tooltip on hover, for a value whose full form is too long for the card.
+        var detail: String? = nil
     }
 
     private enum Row {
@@ -144,15 +146,26 @@ struct ApprovalView: View {
         if let h = ctx.host, !ctx.isPush, !ctx.headline.contains(h) {
             out.append(.field(Field(label: "Server", value: h)))
         }
-        if let by = requestedBy { out.append(.field(Field(label: "Requested by", value: by, mono: false, lines: 2))) }
+        if let by = requestedBy {
+            out.append(.field(Field(label: "Requested by", value: by.short, mono: false, lines: 2, detail: by.full)))
+        }
         if let k = ctx.key { out.append(.field(Field(label: "Key", value: k))) }
         return out
     }
 
-    /// The chain as a breadcrumb, outermost first, with the session title on
-    /// the link that owns it. The app name is only prepended when it adds a
-    /// step the chain does not already show.
-    private var requestedBy: String? {
+    /// The chain as a breadcrumb, outermost first. The card shows one word per
+    /// link — `frizz › claude › zsh › git › ssh` — and the full form, with the
+    /// session title on the link that owns it, sits behind a hover. The app name
+    /// is only prepended when it adds a step the chain does not already show.
+    private var requestedBy: (short: String, full: String)? {
+        guard let full = requestedByFull else { return nil }
+        let short = full.components(separatedBy: "  ›  ")
+            .map { $0.split(separator: " ", maxSplits: 1).first.map(String.init) ?? $0 }
+            .joined(separator: "  ›  ")
+        return (short, full)
+    }
+
+    private var requestedByFull: String? {
         var steps: [String] = []
         for name in ctx.chain {
             let n = name.lowercased()
@@ -353,6 +366,7 @@ struct ApprovalView: View {
                 .truncationMode(.middle)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+                .help(f.detail ?? "")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
