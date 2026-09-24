@@ -54,8 +54,13 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 PLIST
 
 # Sign the nested binary first, then the bundle that contains it.
-codesign --force --sign - --timestamp=none "$app/Contents/MacOS/keywardd" >/dev/null 2>&1
-codesign --force --sign - --timestamp=none "$app" >/dev/null 2>&1 || \
+# CODESIGN_IDENTITY names a certificate in the keychain; the default is ad-hoc. An
+# ad-hoc signature is a new identity to macOS privacy consent on every build, so the
+# Documents/Desktop grant the daemon needs to read a repository is lost each time; any
+# stable certificate (`security find-identity -v -p codesigning`) keeps it.
+sign="${CODESIGN_IDENTITY:--}"
+codesign --force --sign "$sign" --timestamp=none "$app/Contents/MacOS/keywardd" >/dev/null 2>&1
+codesign --force --sign "$sign" --timestamp=none "$app" >/dev/null 2>&1 || \
   echo "    (codesign failed; app still runs, notifications may not)"
 
 echo "==> done"
