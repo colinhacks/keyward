@@ -60,6 +60,53 @@ private final class ContextCache {
     }
 }
 
+// The key handle in the login keychain instead of a file. A keychain item is readable
+// without a prompt only by the application that created it, matched by code signature,
+// so a handle stored by keywardd is not a file any process running as the user can
+// read and use. That is what makes a presence-free enclave key acceptable: the daemon,
+// and the approval window it enforces, become the only way to the key.
+private let kcService = "dev.danielsol.keyward"
+private let kcAccount = "enclave-key"
+
+@_cdecl("kwse_keychain_load")
+public func kwse_keychain_load(_ buf: UnsafeMutablePointer<UInt8>, _ cap: Int) -> Int {
+    let q: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: kcService,
+        kSecAttrAccount as String: kcAccount,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var out: CFTypeRef?
+    let st = SecItemCopyMatching(q as CFDictionary, &out)
+    if st == errSecItemNotFound { return 0 }
+    guard st == errSecSuccess, let d = out as? Data else {
+        FileHandle.standardError.write("keywardd: keychain read failed: \(st)\n".data(using: .utf8)!)
+        return -1
+    }
+    return store(d, buf, cap)
+}
+
+@_cdecl("kwse_keychain_store")
+public func kwse_keychain_store(_ blob: UnsafePointer<UInt8>, _ len: Int, _ force: Int32) -> Int32 {
+    let base: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: kcService,
+        kSecAttrAccount as String: kcAccount,
+    ]
+    if force == 1 { SecItemDelete(base as CFDictionary) }
+    var add = base
+    add[kSecValueData as String] = Data(bytes: blob, count: len)
+    add[kSecAttrLabel as String] = "Keyward Secure Enclave key handle"
+    let st = SecItemAdd(add as CFDictionary, nil)
+    if st == errSecDuplicateItem { return 2 }
+    if st != errSecSuccess {
+        FileHandle.standardError.write("keywardd: keychain write failed: \(st)\n".data(using: .utf8)!)
+        return -1
+    }
+    return 0
+}
+
 @_cdecl("kwse_available")
 public func kwse_available() -> Int32 { SecureEnclave.isAvailable ? 1 : 0 }
 

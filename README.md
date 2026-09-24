@@ -189,6 +189,13 @@ silent background signature is impossible.
 It remains far stronger than an on-disk private key. The key cannot be stolen;
 an attacker has to stay resident on this Mac.
 
+With a signing certificate, the keychain route is open here too: set
+`"enclave_key": "keychain"` in the config before `--generate-key`, and the handle is
+stored in the login keychain as an item only keywardd's own code signature can read
+without a prompt. That is the setting that makes a `none` key reasonable: nothing gets
+to the key except through the daemon, so the daemon's approval window (below) is the
+gate, and it can be as long as you like instead of Apple's five minutes.
+
 ### There is no backup
 
 An enclave key cannot be exported, copied or escrowed. If this machine is lost,
@@ -229,11 +236,14 @@ Sign a commit in nixos-config · Claude
 git push to owner/repo · Ghostty
 ```
 
-`touch_id_reuse_secs` (config, 0 = every signature, macOS caps it at 300) holds
-one authenticated `LAContext` for that long, so a loop over the fleet asks once
-instead of once per host. Setting only
-`touchIDAuthenticationAllowableReuseDuration` on a fresh context per signature
-does nothing — the window only applies within a single context.
+`touch_id_reuse_secs` (config, 0 = every signature) holds one authenticated
+`LAContext` for that long, so a loop over the fleet asks once instead of once per
+host. The window is scoped: it covers requests from the same directory, to the same
+host and remote as the approval, and anything else prompts. A fresh context is
+authenticated explicitly before it signs — the prompt the enclave raises on its own
+does not start the reuse clock. With a `presence` or `biometry` key macOS caps the
+window at 300 seconds; with a `none` key kept in the keychain the window is the
+daemon's alone (86400 for a day).
 
 ## Never overwrite the daemon in place
 

@@ -15,6 +15,8 @@ extern "C" {
     fn kwse_available() -> i32;
     fn kwse_generate(policy: i32, buf: *mut u8, cap: usize) -> isize;
     fn kwse_public(blob: *const u8, blob_len: usize, buf: *mut u8, cap: usize) -> isize;
+    fn kwse_keychain_load(buf: *mut u8, cap: usize) -> isize;
+    fn kwse_keychain_store(blob: *const u8, len: usize, force: i32) -> i32;
     fn kwse_sign(
         blob: *const u8,
         blob_len: usize,
@@ -69,6 +71,51 @@ pub fn available() -> bool {
     unsafe { kwse_available() == 1 }
 }
 
+/// Where the SEP-wrapped handle lives. `enclave_key: "keychain"` in the config keeps it
+/// in the login keychain, readable without a prompt only by keywardd's own code signature;
+/// a path keeps it in a file any process running as the user can read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyStore {
+    File(PathBuf),
+    Keychain,
+}
+
+impl KeyStore {
+    pub fn from_config(v: Option<&str>) -> KeyStore {
+        match v {
+            Some("keychain") => KeyStore::Keychain,
+            Some(p) => KeyStore::File(PathBuf::from(p)),
+            None => KeyStore::File(default_key_path()),
+        }
+    }
+    pub fn describe(&self) -> String {
+        match self {
+            KeyStore::File(p) => p.display().to_string(),
+            KeyStore::Keychain => "login keychain (dev.danielsol.keyward / enclave-key)".into(),
+        }
+    }
+    fn read(&self) -> Option<Vec<u8>> {
+        match self {
+            KeyStore::File(p) => std::fs::read(p).ok(),
+            KeyStore::Keychain => {
+                let mut buf = vec![0u8; 4096];
+                let n = unsafe { kwse_keychain_load(buf.as_mut_ptr(), buf.len()) };
+                if n <= 0 {
+                    return None;
+                }
+                buf.truncate(n as usize);
+                Some(buf)
+            }
+        }
+    }
+    fn exists(&self) -> bool {
+        match self {
+            KeyStore::File(p) => p.exists(),
+            KeyStore::Keychain => self.read().is_some(),
+        }
+    }
+}
+
 pub fn default_key_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join("Library/Application Support/Keyward/enclave-key.blob")
@@ -82,8 +129,8 @@ pub struct Enclave {
 }
 
 impl Enclave {
-    pub fn load(path: &PathBuf, comment: String) -> Option<Enclave> {
-        let blob = std::fs::read(path).ok()?;
+    pub fn load(store: &KeyStore, comment: String) -> Option<Enclave> {
+        let blob = store.read()?;
         if blob.is_empty() {
             return None;
         }
@@ -182,20 +229,17 @@ fn mpint(v: &[u8]) -> Vec<u8> {
 
 /// Create a key. Refuses to clobber an existing one: an enclave key cannot be
 /// exported or backed up, so overwriting it destroys it beyond recovery.
-pub fn generate(path: &PathBuf, policy: Policy, force: bool) -> Result<(), String> {
+pub fn generate(store: &KeyStore, policy: Policy, force: bool) -> Result<(), String> {
     if !available() {
         return Err("no Secure Enclave on this machine".into());
     }
-    if path.exists() && !force {
+    if store.exists() && !force {
         return Err(format!(
-            "{} already exists. Overwriting destroys the existing key permanently \
+            "{} already holds a key. Overwriting destroys the existing key permanently \
              — it cannot be exported or restored. Pass --force only if you have \
              already rotated away from it.",
-            path.display()
+            store.describe()
         ));
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let mut blob = vec![0u8; 4096];
     let n = unsafe { kwse_generate(policy.code(), blob.as_mut_ptr(), blob.len()) };
@@ -203,11 +247,24 @@ pub fn generate(path: &PathBuf, policy: Policy, force: bool) -> Result<(), Strin
         return Err(format!("enclave key generation failed (code {n})"));
     }
     blob.truncate(n as usize);
-    std::fs::write(path, &blob).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(
-        path,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    )
-    .map_err(|e| e.to_string())?;
+    match store {
+        KeyStore::File(path) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(path, &blob).map_err(|e| e.to_string())?;
+            std::fs::set_permissions(
+                path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        KeyStore::Keychain => {
+            let rc = unsafe { kwse_keychain_store(blob.as_ptr(), blob.len(), if force { 1 } else { 0 }) };
+            if rc != 0 {
+                return Err(format!("keychain store failed (code {rc})"));
+            }
+        }
+    }
     Ok(())
 }

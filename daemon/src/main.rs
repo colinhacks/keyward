@@ -258,19 +258,15 @@ fn main() {
     let cfg = load_config(cfg_path.as_deref());
     let timeout = Duration::from_secs(cfg.timeout_secs);
 
-    let key_path = cfg
-        .enclave_key
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(enclave::default_key_path);
+    let key_store = enclave::KeyStore::from_config(cfg.enclave_key.as_deref());
 
     if want_generate {
-        match enclave::generate(&key_path, policy, force) {
+        match enclave::generate(&key_store, policy, force) {
             Ok(()) => {
                 println!("created a Secure Enclave key ({} policy)", policy.label());
-                println!("  handle: {}", key_path.display());
+                println!("  handle: {}", key_store.describe());
                 println!("\nIt cannot be exported or backed up. Authorise it before you rely on it:");
-                if let Some(e) = enclave::Enclave::load(&key_path, cfg.enclave_comment.clone()) {
+                if let Some(e) = enclave::Enclave::load(&key_store, cfg.enclave_comment.clone()) {
                     println!("\n{}\n", e.authorized_key_line());
                 }
                 std::process::exit(0);
@@ -282,7 +278,7 @@ fn main() {
         }
     }
 
-    let enclave = enclave::Enclave::load(&key_path, cfg.enclave_comment.clone());
+    let enclave = enclave::Enclave::load(&key_store, cfg.enclave_comment.clone());
 
     if want_pubkey {
         match &enclave {
