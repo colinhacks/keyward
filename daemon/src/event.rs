@@ -35,6 +35,12 @@ pub struct Event {
     pub upstream: Option<String>,
     /// Host key fingerprint from session-bind, when ssh offered one.
     pub bound_host_fp: Option<String>,
+    /// Where this signature sat, and whether it rode an earlier approval — the
+    /// record of why a Touch ID prompt was or was not raised.
+    #[serde(default)]
+    pub scope: Option<crate::agent::Scope>,
+    #[serde(default)]
+    pub reused: bool,
     pub outcome: String,
     pub duration_ms: u64,
 }

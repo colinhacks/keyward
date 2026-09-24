@@ -7,13 +7,14 @@ use crate::event::{Event, Kind, Log};
 use crate::upstream::Upstream;
 use crate::wire::{self, Reader, Writer};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub const FAILURE: u8 = 5;
@@ -45,6 +46,58 @@ pub struct Ctx {
     /// Overrides the system sheet's text. Empty means "describe the action";
     /// a single space means "say as little as macOS allows".
     pub sheet_reason: String,
+    /// Where the last approval was granted, and when. The reuse window only
+    /// covers further requests from the same place.
+    pub last_approved: Mutex<Option<(Scope, Instant)>>,
+}
+
+/// The blast radius of one Touch ID approval.
+///
+/// An unscoped reuse window means approving a push also silently covers an
+/// unrelated repository, or a login to another host, for the rest of the
+/// window — the one authorisation a human gave is not the one they are asked
+/// about. Scoping keeps the convenience it exists for (a fetch right after a
+/// push in the same checkout rides the same approval, which is why the purpose
+/// kind is deliberately *not* part of the scope) and drops the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    /// The repository the work is in, else the caller's working directory.
+    pub directory: Option<String>,
+    /// SSH destination.
+    pub host: Option<String>,
+    /// The remote being pushed to or fetched from.
+    pub repo: Option<String>,
+}
+
+fn scope_of(who: &Attribution) -> Scope {
+    let git = who.context.git.as_ref();
+    Scope {
+        directory: who
+            .purpose
+            .repo_path
+            .clone()
+            .or_else(|| who.process.as_ref().and_then(|p| p.cwd.clone())),
+        host: who.purpose.host.clone(),
+        repo: git.and_then(|g| g.push_remote_url.clone().or_else(|| g.remote.clone())),
+    }
+}
+
+/// A poisoned lock must never take SSH down; the worst it costs is one more prompt.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Does an earlier approval still cover this request?
+///
+/// Kept pure so the window arithmetic is testable without an enclave.
+fn reuse_covers(last: Option<&(Scope, Instant)>, scope: &Scope, window: f64, now: Instant) -> bool {
+    if window <= 0.0 {
+        return false;
+    }
+    match last {
+        Some((s, at)) => s == scope && now.saturating_duration_since(*at).as_secs_f64() < window,
+        None => false,
+    }
 }
 
 pub fn fingerprint(blob: &[u8]) -> String {
@@ -200,6 +253,8 @@ fn handle_request_identities(ctx: &Ctx, who: &Attribution) -> Vec<u8> {
         key_comment: None,
         upstream: None,
         bound_host_fp: None,
+        scope: None,
+        reused: false,
         outcome: format!("{} keys", ids.len()),
         duration_ms: started.elapsed().as_millis() as u64,
         });
@@ -230,11 +285,24 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
             let headline = prompt_action(who);
             let reason = sheet_reason(who, &ctx.sheet_reason);
             let fp = fingerprint(&blob);
+
+            // Outside the scope of the last approval we pass 0, which makes the
+            // enclave build a fresh LAContext *and* drop the cached one — so the
+            // next in-scope request cannot inherit an authentication the user
+            // granted somewhere else.
+            let scope = scope_of(who);
+            let reused = {
+                let last = lock(&ctx.last_approved);
+                reuse_covers(last.as_ref(), &scope, ctx.touch_id_reuse_secs, Instant::now())
+            };
+            let window = if reused { ctx.touch_id_reuse_secs } else { 0.0 };
+
             let card = crate::ui::show(who, &headline, Some(&e.comment), Some(&fp));
-            let signed = e.sign(&data, &reason, ctx.touch_id_reuse_secs);
+            let signed = e.sign(&data, &reason, window);
             card.done();
             let (reply, outcome) = match signed {
                 Ok(sig) => {
+                    *lock(&ctx.last_approved) = Some((scope.clone(), Instant::now()));
                     let mut w = Writer::new();
                     w.u8(SIGN_RESPONSE);
                     w.string(&sig);
@@ -251,6 +319,8 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
                 key_comment: Some(e.comment.clone()),
                 upstream: Some("Secure Enclave".to_string()),
                 bound_host_fp: bound.clone(),
+                scope: Some(scope),
+                reused,
                 outcome,
                 duration_ms: started.elapsed().as_millis() as u64,
             });
@@ -302,6 +372,9 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
         key_comment: comment,
         upstream: upstream_name,
         bound_host_fp: bound.clone(),
+        // An upstream agent owns its own authentication; the reuse scope is ours alone.
+        scope: None,
+        reused: false,
         outcome,
         duration_ms: started.elapsed().as_millis() as u64,
     });
@@ -341,6 +414,8 @@ fn handle_extension(
                     key_comment: None,
                     upstream: None,
                     bound_host_fp: Some(fp),
+                    scope: None,
+                    reused: false,
                     outcome: "recorded".to_string(),
                     duration_ms: 0,
                     });
@@ -381,6 +456,67 @@ fn serve(mut stream: UnixStream, ctx: Arc<Ctx>) -> io::Result<()> {
 
         stream.write_all(&wire::frame(&reply))?;
         stream.flush()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reuse_covers, Scope};
+    use std::time::{Duration, Instant};
+
+    fn scope(dir: &str, host: &str, repo: &str) -> Scope {
+        Scope {
+            directory: Some(dir.into()),
+            host: Some(host.into()),
+            repo: Some(repo.into()),
+        }
+    }
+
+    #[test]
+    fn a_fresh_approval_covers_the_same_place() {
+        let s = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let now = Instant::now();
+        let last = (s.clone(), now - Duration::from_secs(30));
+        assert!(reuse_covers(Some(&last), &s, 300.0, now));
+    }
+
+    #[test]
+    fn another_directory_host_or_remote_does_not_inherit_it() {
+        let approved = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let now = Instant::now();
+        let last = (approved.clone(), now);
+        for other in [
+            scope("/src/other", "github.com", "git@github.com:me/keyward.git"),
+            scope("/src/keyward", "gitlab.com", "git@github.com:me/keyward.git"),
+            scope("/src/keyward", "github.com", "git@github.com:me/secrets.git"),
+        ] {
+            assert!(
+                !reuse_covers(Some(&last), &other, 300.0, now),
+                "{other:?} must not ride an approval granted for {approved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_expires_and_zero_disables_it() {
+        let s = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let now = Instant::now();
+        let stale = (s.clone(), now - Duration::from_secs(301));
+        assert!(!reuse_covers(Some(&stale), &s, 300.0, now), "past the window");
+        let fresh = (s.clone(), now);
+        assert!(!reuse_covers(Some(&fresh), &s, 0.0, now), "0 asks every time");
+        assert!(!reuse_covers(None, &s, 300.0, now), "nothing approved yet");
+    }
+
+    /// A push and the fetch that follows it in the same checkout are one approval:
+    /// the purpose kind is deliberately outside the scope.
+    #[test]
+    fn a_different_purpose_in_the_same_place_still_rides_it() {
+        let push = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let fetch = push.clone();
+        let now = Instant::now();
+        let last = (push, now - Duration::from_secs(5));
+        assert!(reuse_covers(Some(&last), &fetch, 300.0, now));
     }
 }
 

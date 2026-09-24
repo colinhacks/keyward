@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use upstream::Upstream;
 
@@ -325,6 +325,7 @@ fn main() {
         log_lists: cfg.log_list_identities,
         touch_id_reuse_secs: cfg.touch_id_reuse_secs,
         sheet_reason: cfg.sheet_reason.clone(),
+        last_approved: Mutex::new(None),
     });
 
     eprintln!(
