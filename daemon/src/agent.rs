@@ -67,8 +67,12 @@ pub struct Ctx {
 /// kind is deliberately *not* part of the scope) and drops the rest.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Scope {
-    /// The repository the work is in — its main checkout, so a linked worktree
-    /// shares its clone's approval — else the caller's working directory.
+    /// Where the request came from, kept only when no remote is known: the
+    /// repository's main checkout (so a linked worktree shares its clone's
+    /// approval) else the caller's working directory. When the remote IS known
+    /// it is left out: an approval covers "this host, this repo", not the
+    /// checkout it happened in — a test suite that clones a fresh fixture per
+    /// push to the same repository used to prompt on every one.
     pub directory: Option<String>,
     /// SSH destination.
     pub host: Option<String>,
@@ -78,15 +82,20 @@ pub struct Scope {
 
 fn scope_of(who: &Attribution) -> Scope {
     let git = who.context.git.as_ref();
-    Scope {
-        directory: who
-            .purpose
+    let repo = git.and_then(|g| g.push_remote_url.clone().or_else(|| g.remote.clone()));
+    let directory = if repo.is_some() {
+        None
+    } else {
+        who.purpose
             .repo_path
             .as_deref()
             .map(|r| crate::context::main_checkout(r).unwrap_or_else(|| r.to_string()))
-            .or_else(|| who.process.as_ref().and_then(|p| p.cwd.clone())),
+            .or_else(|| who.process.as_ref().and_then(|p| p.cwd.clone()))
+    };
+    Scope {
+        directory,
         host: who.purpose.host.clone(),
-        repo: git.and_then(|g| g.push_remote_url.clone().or_else(|| g.remote.clone())),
+        repo,
     }
 }
 
