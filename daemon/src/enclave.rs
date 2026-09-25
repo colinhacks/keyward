@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 extern "C" {
     fn kwse_available() -> i32;
-    fn kwse_forget();
+    fn kwse_forget(scope: *const i8);
     fn kwse_generate(policy: i32, buf: *mut u8, cap: usize) -> isize;
     fn kwse_public(blob: *const u8, blob_len: usize, buf: *mut u8, cap: usize) -> isize;
     fn kwse_keychain_load(buf: *mut u8, cap: usize) -> isize;
@@ -25,6 +25,7 @@ extern "C" {
         msg_len: usize,
         reason: *const i8,
         reuse_seconds: f64,
+        scope: *const i8,
         buf: *mut u8,
         cap: usize,
     ) -> isize;
@@ -172,13 +173,18 @@ impl Enclave {
     ///
     /// CryptoKit hashes with SHA-256 internally, which is what
     /// `ecdsa-sha2-nistp256` requires, and returns a raw r||s pair.
-    /// Forget the cached authentication, so the next `sign` prompts even inside a window.
-    pub fn forget(&self) {
-        unsafe { kwse_forget() }
+    /// Forget the cached authentication for `scope`, so its next `sign` prompts even
+    /// inside a window. Other scopes keep theirs.
+    pub fn forget(&self, scope: &str) {
+        let c_scope = CString::new(scope).unwrap_or_default();
+        unsafe { kwse_forget(c_scope.as_ptr()) }
     }
 
-    pub fn sign(&self, data: &[u8], reason: &str, reuse_secs: f64) -> Result<Vec<u8>, String> {
+    /// `scope` keys the cached authentication: each scope holds its own, so an
+    /// approval in one place neither covers nor evicts an approval in another.
+    pub fn sign(&self, data: &[u8], reason: &str, reuse_secs: f64, scope: &str) -> Result<Vec<u8>, String> {
         let c_reason = CString::new(reason).unwrap_or_else(|_| CString::new("").unwrap());
+        let c_scope = CString::new(scope).unwrap_or_default();
         let mut sig = vec![0u8; 256];
         let n = unsafe {
             kwse_sign(
@@ -188,6 +194,7 @@ impl Enclave {
                 data.len(),
                 c_reason.as_ptr(),
                 reuse_secs,
+                c_scope.as_ptr(),
                 sig.as_mut_ptr(),
                 sig.len(),
             )

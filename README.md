@@ -239,7 +239,7 @@ git push to owner/repo · Ghostty
 `touch_id_reuse_secs` (config, 0 = every signature) holds one authenticated
 `LAContext` for that long, so a loop over the fleet asks once instead of once per
 host. The window is scoped: it covers requests from the same directory, to the same
-host and remote as the approval, and anything else prompts. A fresh context is
+host and remote as the approval, and anything else prompts. Each place keeps its own window, so agents working in several repositories at once do not reset one another, and a linked worktree counts as the clone it came from. A fresh context is
 authenticated explicitly before it signs — the prompt the enclave raises on its own
 does not start the reuse clock. With a `presence` or `biometry` key macOS caps the
 window at 300 seconds; with a `none` key kept in the keychain the window is the

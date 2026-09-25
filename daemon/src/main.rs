@@ -321,7 +321,7 @@ fn main() {
         log_lists: cfg.log_list_identities,
         touch_id_reuse_secs: cfg.touch_id_reuse_secs,
         sheet_reason: cfg.sheet_reason.clone(),
-        last_approved: Mutex::new(None),
+        approved: Mutex::new(HashMap::new()),
         sign_gate: Mutex::new(()),
     });
 

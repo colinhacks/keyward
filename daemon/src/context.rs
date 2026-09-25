@@ -194,11 +194,33 @@ fn git_dir(repo: &Path) -> Option<PathBuf> {
     }
     let s = std::fs::read_to_string(&dot).ok()?;
     let p = s.trim().strip_prefix("gitdir:")?.trim();
-    Some(PathBuf::from(p))
+    // A relative gitdir is relative to the worktree, not to the daemon.
+    Some(repo.join(p))
+}
+
+/// The directory shared by every worktree of a repository. A linked worktree's own
+/// gitdir names it in `commondir`; a normal clone's gitdir is already it.
+fn common_dir(gitdir: &Path) -> PathBuf {
+    match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(s) => gitdir.join(s.trim()),
+        Err(_) => gitdir.to_path_buf(),
+    }
+}
+
+/// The main checkout of the repository `repo_path` belongs to, so a linked worktree
+/// and the clone it came from count as one place.
+pub fn main_checkout(repo_path: &str) -> Option<String> {
+    let common = common_dir(&git_dir(Path::new(repo_path))?);
+    let common = common.canonicalize().unwrap_or(common);
+    match common.file_name() {
+        Some(n) if n == ".git" => Some(common.parent()?.to_string_lossy().into_owned()),
+        _ => None,
+    }
 }
 
 fn origin_url(gitdir: &Path) -> Option<String> {
-    let cfg = std::fs::read_to_string(gitdir.join("config")).ok()?;
+    // Remotes live in the shared config, not in a linked worktree's own gitdir.
+    let cfg = std::fs::read_to_string(common_dir(gitdir).join("config")).ok()?;
     let mut in_origin = false;
     for line in cfg.lines() {
         let t = line.trim();
@@ -401,5 +423,30 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::main_checkout;
+    use std::fs;
+
+    /// A linked worktree resolves to the clone it came from, so both share one scope.
+    #[test]
+    fn a_worktree_resolves_to_its_main_checkout() {
+        let root = std::env::temp_dir().join(format!("keyward-wt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let clone = root.join("app");
+        let wt_gitdir = clone.join(".git/worktrees/feature");
+        let wt = clone.join(".worktrees/feature");
+        fs::create_dir_all(&wt_gitdir).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
+
+        let expect = clone.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(main_checkout(wt.to_str().unwrap()).as_deref(), Some(expect.as_str()));
+        assert_eq!(main_checkout(clone.to_str().unwrap()).as_deref(), Some(expect.as_str()));
+        fs::remove_dir_all(&root).unwrap();
     }
 }
