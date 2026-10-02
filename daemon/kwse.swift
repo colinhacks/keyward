@@ -13,12 +13,18 @@ private func store(_ data: Data, _ buf: UnsafeMutablePointer<UInt8>, _ cap: Int)
 }
 
 /// policy: 0 = no auth, 1 = user presence, 2 = current biometry set
+///
+/// A `none` key is the one meant for unattended signing, so it stays usable while the
+/// screen is locked: a WhenUnlocked key refuses every signature then with -25308
+/// (errSecInteractionNotAllowed), which is how agents pushing from a locked Mac failed.
 private func accessControl(_ policy: Int32) -> SecAccessControl? {
     var flags: SecAccessControlCreateFlags = [.privateKeyUsage]
     if policy == 1 { flags.insert(.userPresence) }
     if policy == 2 { flags.insert(.biometryCurrentSet) }
-    return SecAccessControlCreateWithFlags(
-        nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, flags, nil)
+    let accessible = policy == 0
+        ? kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        : kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+    return SecAccessControlCreateWithFlags(nil, accessible, flags, nil)
 }
 
 /// A reuse window only has effect within a single LAContext — a fresh context
@@ -144,6 +150,7 @@ public func kwse_sign(_ blob: UnsafePointer<UInt8>, _ blobLen: Int,
                       _ reason: UnsafePointer<CChar>?,
                       _ reuseSeconds: Double,
                       _ scope: UnsafePointer<CChar>,
+                      _ approve: Int32,
                       _ buf: UnsafeMutablePointer<UInt8>, _ cap: Int) -> Int {
     let d = Data(bytes: blob, count: blobLen)
     // Consecutive signatures within the window share one authentication, so a
@@ -157,7 +164,7 @@ public func kwse_sign(_ blob: UnsafePointer<UInt8>, _ blobLen: Int,
         ctx.localizedReason = t
         text = t
     }
-    if fresh {
+    if fresh && approve != 0 {
         // One explicit authentication, which the reuse window then honours; the
         // signature below rides it without a second prompt. deviceOwnerAuthentication
         // matches the key's presence policy (Touch ID, password as fallback).

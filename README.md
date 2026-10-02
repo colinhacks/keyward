@@ -171,11 +171,13 @@ the request is for, so the prompt reads:
 
 `--policy` decides what each signature costs:
 
-| policy | prompt | survives a fingerprint change |
-|---|---|---|
-| `none` | none | yes |
-| `presence` | Touch ID, password fallback | yes |
-| `biometry` | Touch ID only | **no — the key is destroyed** |
+| policy | the enclave asks | signs while the screen is locked | survives a fingerprint change |
+|---|---|---|---|
+| `none` | never | yes | yes |
+| `presence` | Touch ID, password fallback | no | yes |
+| `biometry` | Touch ID only | no | **no — the key is destroyed** |
+
+The daemon asks on its own as well: a request from a place with no live approval raises Touch ID whatever the key's policy. `"require_approval": false` in the config turns that off, and with a `none` key nothing asks at all, so agents can push while you are away. A `presence` or `biometry` key is created usable only while the Mac is unlocked, and refuses every signature on a locked screen with `-25308`; a `none` key is created usable after the first unlock, because unattended signing is what it is for.
 
 ### The trade-off, stated plainly
 

@@ -43,6 +43,9 @@ pub struct Ctx {
     /// Seconds during which one Touch ID authentication covers further
     /// signatures. 0 asks every time.
     pub touch_id_reuse_secs: f64,
+    /// False signs with our own key without a Touch ID check or an approval card. The
+    /// key still cannot leave the enclave; every signature is still logged.
+    pub require_approval: bool,
     /// Overrides the system sheet's text. Empty means "describe the action";
     /// a single space means "say as little as macOS allows".
     pub sheet_reason: String,
@@ -316,14 +319,17 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
             let _turn = lock(&ctx.sign_gate);
             let key = scope.key();
             let window = ctx.touch_id_reuse_secs;
-            let reused = reuse_covers(&lock(&ctx.approved), &scope, window, Instant::now());
-            if !reused {
+            let approve = ctx.require_approval;
+            let reused = approve && reuse_covers(&lock(&ctx.approved), &scope, window, Instant::now());
+            if approve && !reused {
                 e.forget(&key);
             }
 
-            let card = crate::ui::show(who, &headline, Some(&e.comment), Some(&fp));
-            let signed = e.sign(&data, &reason, window, &key);
-            card.done();
+            let card = approve.then(|| crate::ui::show(who, &headline, Some(&e.comment), Some(&fp)));
+            let signed = e.sign(&data, &reason, window, &key, approve);
+            if let Some(card) = card {
+                card.done();
+            }
             let (reply, outcome) = match signed {
                 Ok(sig) => {
                     let now = Instant::now();

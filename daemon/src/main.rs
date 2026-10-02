@@ -41,6 +41,10 @@ struct Config {
     /// 0 = authenticate every signature. macOS caps this at 300.
     #[serde(default)]
     touch_id_reuse_secs: f64,
+    /// false = sign with our own key without asking. Pair it with a key generated with
+    /// `--policy none`, which is also the kind that keeps signing while the screen is locked.
+    #[serde(default = "default_true")]
+    require_approval: bool,
     #[serde(default)]
     sheet_reason: String,
     #[serde(default)]
@@ -64,6 +68,9 @@ fn default_enclave_comment() -> String {
 
 fn default_timeout() -> u64 {
     10
+}
+fn default_true() -> bool {
+    true
 }
 fn default_max_log() -> u64 {
     32 * 1024 * 1024
@@ -95,6 +102,7 @@ impl Default for Config {
             max_log_bytes: default_max_log(),
             log_list_identities: false,
             touch_id_reuse_secs: 0.0,
+            require_approval: true,
             sheet_reason: String::new(),
             enclave_key: None,
             enclave_comment: default_enclave_comment(),
@@ -320,6 +328,7 @@ fn main() {
         conns: AtomicUsize::new(0),
         log_lists: cfg.log_list_identities,
         touch_id_reuse_secs: cfg.touch_id_reuse_secs,
+        require_approval: cfg.require_approval,
         sheet_reason: cfg.sheet_reason.clone(),
         approved: Mutex::new(HashMap::new()),
         sign_gate: Mutex::new(()),

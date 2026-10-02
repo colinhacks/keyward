@@ -26,6 +26,7 @@ extern "C" {
         reason: *const i8,
         reuse_seconds: f64,
         scope: *const i8,
+        approve: i32,
         buf: *mut u8,
         cap: usize,
     ) -> isize;
@@ -182,7 +183,9 @@ impl Enclave {
 
     /// `scope` keys the cached authentication: each scope holds its own, so an
     /// approval in one place neither covers nor evicts an approval in another.
-    pub fn sign(&self, data: &[u8], reason: &str, reuse_secs: f64, scope: &str) -> Result<Vec<u8>, String> {
+    /// `approve` false skips the daemon's own Touch ID check; a key created with a
+    /// presence policy still makes the enclave ask on its own.
+    pub fn sign(&self, data: &[u8], reason: &str, reuse_secs: f64, scope: &str, approve: bool) -> Result<Vec<u8>, String> {
         let c_reason = CString::new(reason).unwrap_or_else(|_| CString::new("").unwrap());
         let c_scope = CString::new(scope).unwrap_or_default();
         let mut sig = vec![0u8; 256];
@@ -195,6 +198,7 @@ impl Enclave {
                 c_reason.as_ptr(),
                 reuse_secs,
                 c_scope.as_ptr(),
+                approve as i32,
                 sig.as_mut_ptr(),
                 sig.len(),
             )
