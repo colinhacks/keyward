@@ -177,49 +177,59 @@ fn bind(path: &str) -> std::io::Result<UnixListener> {
     Ok(l)
 }
 
-/// Ask our own socket for its identity list. This is what a watchdog runs:
-/// it catches the failure launchd cannot see — a process that is alive and
-/// accepting connections but no longer answering them.
-fn health(path: &str, timeout: Duration) -> i32 {
-    let mut s = match UnixStream::connect(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("unhealthy: cannot connect to {path}: {e}");
-            return 1;
-        }
-    };
+/// Ask a socket for its identity list and return how many keys it offered. It catches
+/// the failure launchd cannot see — a process that is alive and accepting connections
+/// but no longer answering them.
+fn probe(path: &str, timeout: Duration) -> Result<u32, String> {
+    let mut s = UnixStream::connect(path).map_err(|e| format!("cannot connect to {path}: {e}"))?;
     if s.set_read_timeout(Some(timeout)).is_err() || s.set_write_timeout(Some(timeout)).is_err() {
-        return 1;
+        return Err("cannot set a timeout on the socket".into());
     }
     if s.write_all(&wire::frame(&[agent::REQUEST_IDENTITIES])).is_err() {
-        eprintln!("unhealthy: write failed");
-        return 1;
+        return Err("write failed".into());
     }
     let mut len = [0u8; 4];
-    match s.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("unhealthy: no answer within {timeout:?}: {e}");
-            return 1;
-        }
-    }
+    s.read_exact(&mut len)
+        .map_err(|e| format!("no answer within {timeout:?}: {e}"))?;
     let n = u32::from_be_bytes(len);
     let mut body = vec![0u8; n as usize];
     if s.read_exact(&mut body).is_err() {
-        eprintln!("unhealthy: truncated answer");
-        return 1;
+        return Err("truncated answer".into());
     }
     let mut r = wire::Reader::new(&body);
     match (r.u8(), r.u32()) {
-        (Some(agent::IDENTITIES_ANSWER), Some(count)) => {
+        (Some(agent::IDENTITIES_ANSWER), Some(count)) => Ok(count),
+        _ => Err("unexpected reply".into()),
+    }
+}
+
+/// `--health`: probe the socket and say what came back, non-zero if nothing did.
+fn health(path: &str, timeout: Duration) -> i32 {
+    match probe(path, timeout) {
+        Ok(count) => {
             println!("healthy: {count} keys");
             0
         }
-        _ => {
-            eprintln!("unhealthy: unexpected reply");
+        Err(e) => {
+            eprintln!("unhealthy: {e}");
             1
         }
     }
+}
+
+const SELF_CHECK_EVERY: Duration = Duration::from_secs(120);
+
+/// The watchdog, in-process. The daemon asks its own socket what `--health` asks, and
+/// exits when nothing comes back, so launchd's KeepAlive starts a fresh one. This was a
+/// second LaunchAgent running `--health` on a timer; a thread costs no extra login item.
+fn watch_self(path: String, timeout: Duration) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(SELF_CHECK_EVERY);
+        if let Err(e) = probe(&path, timeout) {
+            eprintln!("keywardd: not answering its own socket ({e}) — exiting so launchd restarts it");
+            std::process::exit(1);
+        }
+    });
 }
 
 fn main() {
@@ -344,6 +354,8 @@ fn main() {
             ""
         }
     );
+
+    watch_self(cfg.listen.clone(), timeout);
 
     for stream in listener.incoming() {
         match stream {

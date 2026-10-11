@@ -30,7 +30,17 @@ enum AgentInstaller {
                                                  withIntermediateDirectories: true)
         let uid = getuid()
         sync(label: agentLabel, plist: agentPlist(), uid: uid)
-        sync(label: watchdogLabel, plist: watchdogPlist(), uid: uid)
+        removeWatchdog(uid: uid)
+    }
+
+    /// The watchdog was a second LaunchAgent that probed the socket on a timer. The
+    /// daemon now probes itself and exits when it gets no answer, so KeepAlive on the
+    /// one agent does the same job; an install from before that still has the old plist.
+    private static func removeWatchdog(uid: uid_t) {
+        let url = launchAgents.appendingPathComponent("\(watchdogLabel).plist")
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        _ = launchctl(["bootout", "gui/\(uid)/\(watchdogLabel)"])
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// Only touches launchd when the plist actually changed — a rewrite on
@@ -95,38 +105,4 @@ enum AgentInstaller {
         """
     }
 
-    private static func watchdogPlist() -> String {
-        // The check launchd cannot make for itself: a real request against the
-        // socket, restarting the agent when it stops answering rather than only
-        // when it dies.
-        let cmd = "\(shellQuote(daemonPath)) --health >/dev/null 2>&1 "
-                + "|| /bin/launchctl kickstart -k gui/$(id -u)/\(agentLabel)"
-        return """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-          <key>Label</key><string>\(watchdogLabel)</string>
-          <key>ProgramArguments</key>
-          <array>
-            <string>/bin/sh</string>
-            <string>-c</string>
-            <string>\(xmlEscape(cmd))</string>
-          </array>
-          <key>StartInterval</key><integer>120</integer>
-          <key>RunAtLoad</key><false/>
-        </dict>
-        </plist>
-        """
-    }
-
-    private static func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    private static func xmlEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;")
-         .replacingOccurrences(of: "<", with: "&lt;")
-         .replacingOccurrences(of: ">", with: "&gt;")
-    }
 }

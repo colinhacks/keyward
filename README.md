@@ -58,8 +58,9 @@ noticed, because `KeepAlive.Crashed` only sees a process that died.
   upstream cannot stall an unrelated caller.
 - **Every upstream call is timeout-bounded** (`timeout_secs`, default 10).
 - **`keywardd --health`** performs a real request against the socket and exits
-  non-zero if it is not answered — the check launchd cannot do. Run it from a
-  periodic agent to make the wedge self-healing.
+  non-zero if it is not answered — the check launchd cannot do. The daemon runs
+  the same probe against its own socket every two minutes and exits when nothing
+  answers, so KeepAlive replaces a wedged process without a second agent.
 - **A stale socket is cleared, a live one is respected.** The old mux
   crash-looped on "Address already in use" forever; Keyward connects first and
   only removes the file if nothing answers.
@@ -295,10 +296,11 @@ The daemon ships **inside** `Keyward.app/Contents/MacOS/keywardd`, so the app is
 the whole product: one thing to move, one path for launchd, and no dependency
 on a checkout that could be cleaned or relocated out from under SSH.
 
-On launch the app writes `dev.danielsol.keyward.agent` and
-`.watchdog` into `~/Library/LaunchAgents`, pointing at the bundle it is
-running from, and reloads them only when the contents actually change. Move the
-app and the next launch repairs the paths by itself.
+On launch the app writes `dev.danielsol.keyward.agent` into
+`~/Library/LaunchAgents`, pointing at the bundle it is running from, and reloads
+it only when the contents actually change. Move the app and the next launch
+repairs the path by itself. It is the only login item: the daemon is its own
+watchdog, and a `.watchdog` agent left by an older build is removed.
 
 `keywardd` is also reachable directly for `--health`, `--pubkey` and
 `--generate-key`; `dist/keywardd` is a symlink to the copy inside the bundle.
