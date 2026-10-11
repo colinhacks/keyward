@@ -26,7 +26,11 @@ struct UpstreamCfg {
     path: String,
 }
 
+/// Every field is optional: one the file leaves out takes its default, so a config
+/// can be as short as `{"sign_in_secs": 0}`. A missing `listen` used to fail the
+/// whole file, and the daemon then ran on defaults with the one setting ignored.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct Config {
     listen: String,
     log: String,
@@ -38,7 +42,12 @@ struct Config {
     /// Where the SEP-wrapped handle for our own key lives.
     #[serde(default)]
     log_list_identities: bool,
-    /// 0 = authenticate every signature. macOS caps this at 300.
+    /// How long one sign-in lasts: a single Touch ID that covers every signature from
+    /// every repository and host. 0 = no sign-in, and `touch_id_reuse_secs` decides.
+    #[serde(default = "default_sign_in")]
+    sign_in_secs: f64,
+    /// Without a sign-in: how long one approval covers the place it was given in.
+    /// 0 = authenticate every signature.
     #[serde(default)]
     touch_id_reuse_secs: f64,
     /// false = sign with our own key without asking. Pair it with a key generated with
@@ -72,6 +81,10 @@ fn default_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
+/// A day.
+fn default_sign_in() -> f64 {
+    86400.0
+}
 fn default_max_log() -> u64 {
     32 * 1024 * 1024
 }
@@ -101,6 +114,7 @@ impl Default for Config {
             timeout_secs: default_timeout(),
             max_log_bytes: default_max_log(),
             log_list_identities: false,
+            sign_in_secs: default_sign_in(),
             touch_id_reuse_secs: 0.0,
             require_approval: true,
             sheet_reason: String::new(),
@@ -128,9 +142,18 @@ fn load_config(path: Option<&str>) -> Config {
     let mut cfg = match std::fs::read_to_string(&p) {
         Ok(s) => match serde_json::from_str::<Config>(&s) {
             Ok(c) => c,
+            // A file that cannot be read may have been asking for something stricter
+            // than the defaults, so it does not get the day-long sign-in: every
+            // signature asks until it is fixed.
             Err(e) => {
-                eprintln!("keywardd: bad config {}: {e} — using defaults", p.display());
-                Config::default()
+                eprintln!(
+                    "keywardd: bad config {}: {e} — using defaults, without a sign-in",
+                    p.display()
+                );
+                Config {
+                    sign_in_secs: 0.0,
+                    ..Config::default()
+                }
             }
         },
         Err(_) => Config::default(),
@@ -337,6 +360,7 @@ fn main() {
         timeout,
         conns: AtomicUsize::new(0),
         log_lists: cfg.log_list_identities,
+        sign_in_secs: cfg.sign_in_secs,
         touch_id_reuse_secs: cfg.touch_id_reuse_secs,
         require_approval: cfg.require_approval,
         sheet_reason: cfg.sheet_reason.clone(),
@@ -362,5 +386,24 @@ fn main() {
             Ok(s) => agent::spawn(s, Arc::clone(&ctx)),
             Err(e) => eprintln!("keywardd: accept failed: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    /// Turning the sign-in off is one line, and that line has to be allowed to be
+    /// the whole file: when a missing `listen` failed the parse, the daemon fell
+    /// back to its defaults and the day-long sign-in the file had just declined.
+    #[test]
+    fn a_config_may_set_one_thing_and_leave_the_rest() {
+        let cfg: Config = serde_json::from_str(r#"{"sign_in_secs": 0}"#).unwrap();
+        assert_eq!(cfg.sign_in_secs, 0.0);
+        assert!(cfg.listen.ends_with("/.ssh/keyward.sock"));
+        assert!(cfg.require_approval);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.sign_in_secs, 86400.0, "a day, unless the file says otherwise");
     }
 }

@@ -49,6 +49,9 @@ struct Show<'a> {
     stat: Option<String>,
     /// For a push: the remote-tracking ref the range was computed against; None means a new branch.
     upstream: Option<String>,
+    /// Set on the request that signs in: how long the sign-in lasts ("24 hours").
+    /// Approving it covers every later request, so the card has to say so.
+    sign_in: Option<&'a str>,
 }
 
 /// A name a human recognises for a link in the chain. `node` says nothing when it is the frizz
@@ -123,7 +126,13 @@ fn stdin_script(pid: i32) -> Option<String> {
     if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
-pub fn show(who: &Attribution, headline: &str, key: Option<&str>, fp: Option<&str>) -> Card {
+pub fn show(
+    who: &Attribution,
+    headline: &str,
+    key: Option<&str>,
+    fp: Option<&str>,
+    sign_in: Option<&str>,
+) -> Card {
     let mut stream = match UnixStream::connect(socket_path()) {
         Ok(s) => s,
         Err(_) => return Card(None), // app not running; sign without the card
@@ -181,6 +190,7 @@ pub fn show(who: &Attribution, headline: &str, key: Option<&str>, fp: Option<&st
         commit_count: git.and_then(|g| g.commit_count),
         stat: git.and_then(|g| g.stat.clone()),
         upstream: git.and_then(|g| g.upstream.clone()),
+        sign_in,
         // The title if we could resolve it, the raw id only as a last resort.
         session: who
             .context

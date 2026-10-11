@@ -40,8 +40,12 @@ pub struct Ctx {
     /// Identity listings carry no signature and happen several times per ssh
     /// connection, so they are noise by default. Signatures are the record.
     pub log_lists: bool,
-    /// Seconds during which one Touch ID authentication covers further
-    /// signatures. 0 asks every time.
+    /// Seconds one sign-in lasts. While it is live every request for our own key is
+    /// signed without asking, whatever repository or host it comes from. 0 turns the
+    /// sign-in off, and each place is approved on its own for `touch_id_reuse_secs`.
+    pub sign_in_secs: f64,
+    /// Without a sign-in: seconds during which one Touch ID authentication covers
+    /// further signatures from the same place. 0 asks every time.
     pub touch_id_reuse_secs: f64,
     /// False signs with our own key without a Touch ID check or an approval card. The
     /// key still cannot leave the enclave; every signature is still logged.
@@ -49,10 +53,11 @@ pub struct Ctx {
     /// Overrides the system sheet's text. Empty means "describe the action";
     /// a single space means "say as little as macOS allows".
     pub sheet_reason: String,
-    /// Where each live approval was granted, and when. A window only covers
+    /// What each live approval covers, and when it was granted on `clock`. A
+    /// sign-in is one entry covering everything. Without one, a window only covers
     /// further requests from the same place, and every place keeps its own: two
     /// agents in two repositories must not evict each other's approval.
-    pub approved: Mutex<HashMap<Scope, Instant>>,
+    pub approved: Mutex<HashMap<Reach, f64>>,
     /// Every connection runs on its own thread, and two Touch ID prompts at once
     /// cancel each other ("Canceled by another authentication"), so signatures
     /// take turns: the second request waits for the first prompt to finish, and
@@ -102,10 +107,35 @@ fn scope_of(who: &Attribution) -> Scope {
     }
 }
 
-impl Scope {
-    /// The key the enclave caches this scope's authentication under.
+/// What one approval covers.
+///
+/// A sign-in is the deliberate exception to the scoping above: the user is asked
+/// for a day's worth of signatures everywhere, the prompt and the card say so, and
+/// that is the authorisation they give.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Reach {
+    /// A sign-in: every request, wherever it comes from.
+    Everywhere,
+    /// One place, and nothing else.
+    Place(Scope),
+}
+
+impl Reach {
+    /// The key the enclave holds this approval's authenticated context under.
     fn key(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        match self {
+            Reach::Everywhere => "everywhere".to_string(),
+            Reach::Place(scope) => serde_json::to_string(scope).unwrap_or_default(),
+        }
+    }
+}
+
+/// What approving a request from `place` covers, and for how many seconds.
+fn grant(sign_in_secs: f64, reuse_secs: f64, place: &Scope) -> (Reach, f64) {
+    if sign_in_secs > 0.0 {
+        (Reach::Everywhere, sign_in_secs)
+    } else {
+        (Reach::Place(place.clone()), reuse_secs)
     }
 }
 
@@ -114,14 +144,108 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Seconds on a clock that keeps counting while the Mac sleeps. `Instant` stops
+/// then, so a sign-in measured with it lasted a day of waking time, not a day.
+///
+/// NaN when the clock cannot be read: every comparison with it is false, so
+/// nothing counts as live and every request asks.
+fn clock() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return f64::NAN;
+    }
+    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+}
+
 /// Does an earlier approval still cover this request?
 ///
 /// Kept pure so the window arithmetic is testable without an enclave.
-fn reuse_covers(approved: &HashMap<Scope, Instant>, scope: &Scope, window: f64, now: Instant) -> bool {
-    window > 0.0
-        && approved
-            .get(scope)
-            .is_some_and(|at| now.saturating_duration_since(*at).as_secs_f64() < window)
+fn reuse_covers(approved: &HashMap<Reach, f64>, reach: &Reach, window: f64, now: f64) -> bool {
+    window > 0.0 && approved.get(reach).is_some_and(|at| now - *at < window)
+}
+
+/// Drop the approvals that have run out, and say which: the enclave is still
+/// holding an authenticated context for each of them.
+fn expire(approved: &mut HashMap<Reach, f64>, window: f64, now: f64) -> Vec<Reach> {
+    let gone: Vec<Reach> = approved
+        .iter()
+        .filter(|(_, at)| now - **at >= window)
+        .map(|(reach, _)| reach.clone())
+        .collect();
+    for reach in &gone {
+        approved.remove(reach);
+    }
+    gone
+}
+
+/// 86400 -> "24 hours", in the largest unit that divides it evenly, so the sheet
+/// never says "1440 minutes". Days start at two: one day reads as its hours.
+fn span(secs: f64) -> String {
+    let s = secs.round().max(1.0) as u64;
+    let (n, unit) = match s {
+        s if s % 86400 == 0 && s > 86400 => (s / 86400, "day"),
+        s if s % 3600 == 0 => (s / 3600, "hour"),
+        s if s % 60 == 0 => (s / 60, "minute"),
+        s => (s, "second"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// What one request needs, settled before the enclave is touched.
+#[derive(Debug, PartialEq)]
+struct Plan {
+    /// What approving this request covers.
+    reach: Reach,
+    /// Seconds that approval lasts. 0 keeps nothing: every signature asks.
+    window: f64,
+    /// An earlier approval still covers this request.
+    live: bool,
+    /// Approvals that ran out. The enclave still holds a context for each.
+    expired: Vec<Reach>,
+    /// How long the sign-in this request opens will last, when it opens one. Only
+    /// that request says so, on the sheet and on the card.
+    signing_in: Option<String>,
+    /// Seconds within which a Touch ID unlock of the Mac may answer the prompt
+    /// without it being shown. A place allows it, as it always has. A sign-in
+    /// never does: a day everywhere is not handed out unseen.
+    unlock_reuse: f64,
+}
+
+/// Kept pure, like the arithmetic above, so the rules are testable without an enclave.
+///
+/// The sign-in is the daemon's own check. With `approve` off there is none: holding
+/// a context for a day then would let the one prompt a presence key raises by
+/// itself, which names a single action, cover a day of signatures nobody was
+/// asked about.
+fn decide(
+    approve: bool,
+    sign_in_secs: f64,
+    reuse_secs: f64,
+    place: &Scope,
+    approved: &mut HashMap<Reach, f64>,
+    now: f64,
+) -> Plan {
+    let (reach, window) = grant(if approve { sign_in_secs } else { 0.0 }, reuse_secs, place);
+    let expired = expire(approved, window, now);
+    let live = reuse_covers(approved, &reach, window, now);
+    let everywhere = reach == Reach::Everywhere;
+    Plan {
+        signing_in: (everywhere && !live).then(|| span(window)),
+        unlock_reuse: if everywhere { 0.0 } else { window },
+        reach,
+        window,
+        live,
+        expired,
+    }
+}
+
+/// A signature went through. The approval it opened starts now; one it rode
+/// stays where it was opened, so a sign-in is a day from the sign-in and not a
+/// day from its last use.
+fn opened(approved: &mut HashMap<Reach, f64>, plan: &Plan, now: f64) {
+    if !plan.live && plan.window > 0.0 {
+        approved.insert(plan.reach.clone(), now);
+    }
 }
 
 pub fn fingerprint(blob: &[u8]) -> String {
@@ -182,9 +306,23 @@ fn prompt_action(who: &Attribution) -> String {
 /// What the system sheet says. The card behind it already carries the headline,
 /// the app, the command and the key, so repeating any of it here just makes the
 /// small panel wordier than the big one.
-fn sheet_reason(who: &Attribution, configured: &str) -> String {
-    if !configured.is_empty() {
-        return crate::purpose::shorten(&sanitise(configured), PROMPT_MAX);
+///
+/// `sign_in` is how long the sign-in this prompt opens will last. That approval
+/// reaches past the action that raised it, so the sheet leads with it.
+fn sheet_reason(who: &Attribution, configured: &str, sign_in: Option<&str>) -> String {
+    let configured = (!configured.is_empty()).then(|| sanitise(configured));
+    // A configured text may replace the action, never the sign-in: the sheet is
+    // the one place the grant is certain to be read, the card being best-effort.
+    if let Some(span) = sign_in {
+        let rest = configured.unwrap_or_else(|| prompt_action(who));
+        let said = match rest.as_str() {
+            "" => format!("Sign in for {span}"),
+            rest => format!("Sign in for {span} · {rest}"),
+        };
+        return crate::purpose::shorten(&said, PROMPT_MAX);
+    }
+    if let Some(configured) = configured {
+        return crate::purpose::shorten(&configured, PROMPT_MAX);
     }
     let action = prompt_action(who);
     match who.app.as_ref().map(|a| sanitise(&a.name)) {
@@ -279,6 +417,7 @@ fn handle_request_identities(ctx: &Ctx, who: &Attribution) -> Vec<u8> {
         bound_host_fp: None,
         scope: None,
         reused: false,
+        sign_in: false,
         outcome: format!("{} keys", ids.len()),
         duration_ms: started.elapsed().as_millis() as u64,
         });
@@ -307,45 +446,56 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
             let data = r2.string().unwrap_or(&[]).to_vec();
 
             let headline = prompt_action(who);
-            let reason = sheet_reason(who, &ctx.sheet_reason);
             let fp = fingerprint(&blob);
 
-            // Without a live approval for this scope its cached authentication is
-            // dropped first, so this request prompts and cannot inherit an approval
-            // the user granted somewhere else. Approvals elsewhere are untouched.
-            // The window itself is always passed: the prompt this request raises is
-            // what opens the window, so its context has to be the one kept.
+            // The daemon keeps the only clock. Approvals that have run out are dropped
+            // together with the authenticated context the enclave held for each, and
+            // without a live one this request's own context is dropped too, so it
+            // prompts and cannot inherit an approval the user granted somewhere else.
             let scope = scope_of(who);
-            let _turn = lock(&ctx.sign_gate);
-            let key = scope.key();
-            let window = ctx.touch_id_reuse_secs;
             let approve = ctx.require_approval;
-            let reused = approve && reuse_covers(&lock(&ctx.approved), &scope, window, Instant::now());
-            if approve && !reused {
+            let _turn = lock(&ctx.sign_gate);
+            let plan = decide(
+                approve,
+                ctx.sign_in_secs,
+                ctx.touch_id_reuse_secs,
+                &scope,
+                &mut lock(&ctx.approved),
+                clock(),
+            );
+            let key = plan.reach.key();
+            for gone in &plan.expired {
+                e.forget(&gone.key());
+            }
+            if !plan.live {
                 e.forget(&key);
             }
+            let reused = approve && plan.live;
+            let signing_in = plan.signing_in.as_deref();
+            let reason = sheet_reason(who, &ctx.sheet_reason, signing_in);
 
-            let card = approve.then(|| crate::ui::show(who, &headline, Some(&e.comment), Some(&fp)));
-            let signed = e.sign(&data, &reason, window, &key, approve);
+            let card = approve
+                .then(|| crate::ui::show(who, &headline, Some(&e.comment), Some(&fp), signing_in));
+            let signed = e.sign(&data, &reason, &key, plan.window > 0.0, plan.unlock_reuse, approve);
             if let Some(card) = card {
                 card.done();
             }
             let (reply, outcome) = match signed {
                 Ok(sig) => {
-                    let now = Instant::now();
-                    let mut approved = lock(&ctx.approved);
-                    approved.retain(|_, at| now.saturating_duration_since(*at).as_secs_f64() < window);
-                    // A reused signature leaves the window where its approval opened it.
-                    if !reused && window > 0.0 {
-                        approved.insert(scope.clone(), now);
-                    }
-                    drop(approved);
+                    opened(&mut lock(&ctx.approved), &plan, clock());
                     let mut w = Writer::new();
                     w.u8(SIGN_RESPONSE);
                     w.string(&sig);
                     (w.buf, "ok".to_string())
                 }
-                Err(err) => (failure(), err),
+                Err(err) => {
+                    // The context this request built may have been authenticated
+                    // before the signature failed. No approval was opened to end it.
+                    if !plan.live {
+                        e.forget(&key);
+                    }
+                    (failure(), err)
+                }
             };
 
             ctx.log.append(&Event {
@@ -358,6 +508,7 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
                 bound_host_fp: bound.clone(),
                 scope: Some(scope),
                 reused,
+                sign_in: plan.reach == Reach::Everywhere,
                 outcome,
                 duration_ms: started.elapsed().as_millis() as u64,
             });
@@ -412,6 +563,7 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
         // An upstream agent owns its own authentication; the reuse scope is ours alone.
         scope: None,
         reused: false,
+        sign_in: false,
         outcome,
         duration_ms: started.elapsed().as_millis() as u64,
     });
@@ -453,6 +605,7 @@ fn handle_extension(
                     bound_host_fp: Some(fp),
                     scope: None,
                     reused: false,
+                    sign_in: false,
                     outcome: "recorded".to_string(),
                     duration_ms: 0,
                     });
@@ -498,9 +651,14 @@ fn serve(mut stream: UnixStream, ctx: Arc<Ctx>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{reuse_covers, Scope};
+    use super::{decide, expire, grant, opened, reuse_covers, sheet_reason, span, PurposeKind, Reach, Scope};
+    use crate::attrib::{AppInfo, Attribution};
+    use crate::purpose::Purpose;
     use std::collections::HashMap;
-    use std::time::{Duration, Instant};
+
+    const DAY: f64 = 86400.0;
+    /// Any reading of the daemon's clock; only differences matter.
+    const NOW: f64 = 500_000.0;
 
     fn scope(dir: &str, host: &str, repo: &str) -> Scope {
         Scope {
@@ -510,30 +668,32 @@ mod tests {
         }
     }
 
-    fn approved(entries: &[(&Scope, Instant)]) -> HashMap<Scope, Instant> {
-        entries.iter().map(|(s, at)| ((*s).clone(), *at)).collect()
+    fn place(dir: &str, host: &str, repo: &str) -> Reach {
+        Reach::Place(scope(dir, host, repo))
+    }
+
+    fn approved(entries: &[(&Reach, f64)]) -> HashMap<Reach, f64> {
+        entries.iter().map(|(r, at)| ((*r).clone(), *at)).collect()
     }
 
     #[test]
     fn a_fresh_approval_covers_the_same_place() {
-        let s = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
-        let now = Instant::now();
-        let a = approved(&[(&s, now - Duration::from_secs(30))]);
-        assert!(reuse_covers(&a, &s, 300.0, now));
+        let s = place("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let a = approved(&[(&s, NOW - 30.0)]);
+        assert!(reuse_covers(&a, &s, 300.0, NOW));
     }
 
     #[test]
     fn another_directory_host_or_remote_does_not_inherit_it() {
-        let s = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
-        let now = Instant::now();
-        let a = approved(&[(&s, now)]);
+        let s = place("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let a = approved(&[(&s, NOW)]);
         for other in [
-            scope("/src/other", "github.com", "git@github.com:me/keyward.git"),
-            scope("/src/keyward", "gitlab.com", "git@github.com:me/keyward.git"),
-            scope("/src/keyward", "github.com", "git@github.com:me/secrets.git"),
+            place("/src/other", "github.com", "git@github.com:me/keyward.git"),
+            place("/src/keyward", "gitlab.com", "git@github.com:me/keyward.git"),
+            place("/src/keyward", "github.com", "git@github.com:me/secrets.git"),
         ] {
             assert!(
-                !reuse_covers(&a, &other, 300.0, now),
+                !reuse_covers(&a, &other, 300.0, NOW),
                 "{other:?} must not ride an approval granted for {s:?}"
             );
         }
@@ -541,39 +701,256 @@ mod tests {
 
     #[test]
     fn the_window_expires_and_zero_disables_it() {
-        let s = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
-        let now = Instant::now();
-        let stale = approved(&[(&s, now - Duration::from_secs(301))]);
-        assert!(!reuse_covers(&stale, &s, 300.0, now), "past the window");
-        let fresh = approved(&[(&s, now)]);
-        assert!(!reuse_covers(&fresh, &s, 0.0, now), "0 asks every time");
-        assert!(!reuse_covers(&HashMap::new(), &s, 300.0, now), "nothing approved yet");
+        let s = place("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let stale = approved(&[(&s, NOW - 301.0)]);
+        assert!(!reuse_covers(&stale, &s, 300.0, NOW), "past the window");
+        let fresh = approved(&[(&s, NOW)]);
+        assert!(!reuse_covers(&fresh, &s, 0.0, NOW), "0 asks every time");
+        assert!(!reuse_covers(&HashMap::new(), &s, 300.0, NOW), "nothing approved yet");
     }
 
     /// A push and the fetch that follows it in the same checkout are one approval:
     /// the purpose kind is deliberately outside the scope.
     #[test]
     fn a_different_purpose_in_the_same_place_still_rides_it() {
-        let push = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let push = place("/src/keyward", "github.com", "git@github.com:me/keyward.git");
         let fetch = push.clone();
-        let now = Instant::now();
-        let a = approved(&[(&push, now - Duration::from_secs(5))]);
-        assert!(reuse_covers(&a, &fetch, 300.0, now));
+        let a = approved(&[(&push, NOW - 5.0)]);
+        assert!(reuse_covers(&a, &fetch, 300.0, NOW));
     }
 
     /// Two agents in two repositories, approved one after the other: the second
     /// approval must not evict the first, or alternating requests prompt every time.
     #[test]
     fn approvals_in_two_places_coexist() {
-        let ccbroker = scope("/src/ccbroker", "git@github.com", "git@github.com:me/ccbroker.git");
-        let frizz = scope("/src/frizz", "git@github.com", "git@github.com:me/frizz.git");
-        let now = Instant::now();
-        let a = approved(&[
-            (&ccbroker, now - Duration::from_secs(180)),
-            (&frizz, now - Duration::from_secs(160)),
-        ]);
-        assert!(reuse_covers(&a, &ccbroker, 300.0, now));
-        assert!(reuse_covers(&a, &frizz, 300.0, now));
+        let ccbroker = place("/src/ccbroker", "git@github.com", "git@github.com:me/ccbroker.git");
+        let frizz = place("/src/frizz", "git@github.com", "git@github.com:me/frizz.git");
+        let a = approved(&[(&ccbroker, NOW - 180.0), (&frizz, NOW - 160.0)]);
+        assert!(reuse_covers(&a, &ccbroker, 300.0, NOW));
+        assert!(reuse_covers(&a, &frizz, 300.0, NOW));
+    }
+
+    /// The sign-in: one approval, granted from one repository, covers a push from
+    /// another and a login to a host that has nothing to do with either.
+    #[test]
+    fn a_sign_in_covers_every_place() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let (reach, window) = grant(DAY, 300.0, &keyward);
+        assert_eq!((&reach, window), (&Reach::Everywhere, DAY));
+        let a = approved(&[(&reach, NOW - 6.0 * 3600.0)]);
+        for other in [
+            scope("/src/frizz", "github.com", "git@github.com:me/frizz.git"),
+            scope("/home", "root@server.example", ""),
+            Scope::default(),
+        ] {
+            let (theirs, window) = grant(DAY, 300.0, &other);
+            assert!(reuse_covers(&a, &theirs, window, NOW), "{other:?} is signed in too");
+        }
+    }
+
+    #[test]
+    fn a_sign_in_lasts_its_day_and_no_longer() {
+        let a = approved(&[(&Reach::Everywhere, NOW - DAY + 1.0)]);
+        assert!(reuse_covers(&a, &Reach::Everywhere, DAY, NOW), "a second short of a day");
+        let a = approved(&[(&Reach::Everywhere, NOW - DAY)]);
+        assert!(!reuse_covers(&a, &Reach::Everywhere, DAY, NOW), "a day is up");
+    }
+
+    /// `sign_in_secs: 0` is the old behaviour exactly: each place on its own, for
+    /// `touch_id_reuse_secs`.
+    #[test]
+    fn without_a_sign_in_each_place_is_approved_on_its_own() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        assert_eq!(grant(0.0, 300.0, &keyward), (Reach::Place(keyward.clone()), 300.0));
+        assert_eq!(grant(0.0, 0.0, &keyward), (Reach::Place(keyward), 0.0));
+    }
+
+    /// The enclave holds an authenticated context for every approval, under this
+    /// key. A place must never be able to name the sign-in's.
+    #[test]
+    fn a_place_never_shares_the_sign_in_context() {
+        let nowhere = Reach::Place(Scope::default());
+        assert_ne!(nowhere.key(), Reach::Everywhere.key());
+        assert_ne!(
+            place("everywhere", "everywhere", "everywhere").key(),
+            Reach::Everywhere.key()
+        );
+    }
+
+    /// What has run out is handed back, so the enclave can be told to let go of it;
+    /// what is still live stays.
+    #[test]
+    fn expired_approvals_are_dropped_and_named() {
+        let old = place("/src/ccbroker", "github.com", "git@github.com:me/ccbroker.git");
+        let live = place("/src/frizz", "github.com", "git@github.com:me/frizz.git");
+        let mut a = approved(&[(&old, NOW - 300.0), (&live, NOW - 299.0)]);
+        assert_eq!(expire(&mut a, 300.0, NOW), vec![old]);
+        assert_eq!(a.keys().collect::<Vec<_>>(), vec![&live]);
+        assert!(expire(&mut a, 300.0, NOW).is_empty());
+
+        let mut signed_in = approved(&[(&Reach::Everywhere, NOW - DAY)]);
+        assert_eq!(expire(&mut signed_in, DAY, NOW), vec![Reach::Everywhere]);
+        assert!(signed_in.is_empty());
+    }
+
+    fn pushing(remote_repo: &str) -> Attribution {
+        Attribution {
+            pid: 1,
+            process: None,
+            ancestry: Vec::new(),
+            app: Some(AppInfo {
+                bundle_path: "/Applications/Ghostty.app".into(),
+                name: "Ghostty".into(),
+                depth: 2,
+            }),
+            apps: Vec::new(),
+            destination: None,
+            purpose: Purpose {
+                kind: PurposeKind::GitPush,
+                summary: String::new(),
+                host: Some("git@github.com".into()),
+                repo: None,
+                repo_path: None,
+                remote_repo: Some(remote_repo.into()),
+                namespace: None,
+                remote_command: None,
+            },
+            context: Default::default(),
+        }
+    }
+
+    /// The sheet cannot be screenshotted, so what it says is pinned here. Approving
+    /// a sign-in grants more than the request that raised it: the sheet leads with
+    /// that, and gives up the app's name and then the tail of the action to fit.
+    #[test]
+    fn a_sign_in_leads_the_sheet() {
+        let who = pushing("me/keyward.git");
+        assert_eq!(sheet_reason(&who, "", None), "git push to me/keyward · Ghostty");
+        assert_eq!(
+            sheet_reason(&who, "", Some("24 hours")),
+            "Sign in for 24 hours · git push to me/keyward"
+        );
+        let long = sheet_reason(&pushing("an-organisation/a-repository.git"), "", Some("24 hours"));
+        assert_eq!(long, "Sign in for 24 hours · git push to an-organisation/a-rep…");
+    }
+
+    /// `sheet_reason` in the config replaces the action. It must not be able to
+    /// take the sign-in off the sheet: a single space, "say as little as macOS
+    /// allows", would otherwise grant a day on a sheet that mentions none of it.
+    #[test]
+    fn a_configured_sheet_text_cannot_hide_a_sign_in() {
+        let who = pushing("me/keyward.git");
+        assert_eq!(sheet_reason(&who, "Approve", None), "Approve");
+        assert_eq!(sheet_reason(&who, " ", None), "");
+        assert_eq!(sheet_reason(&who, "Approve", Some("24 hours")), "Sign in for 24 hours · Approve");
+        assert_eq!(sheet_reason(&who, " ", Some("24 hours")), "Sign in for 24 hours");
+    }
+
+    /// The whole day, as the daemon decides it: the first request anywhere signs
+    /// in, everything after rides it from anywhere, and the day runs from the
+    /// sign-in rather than from the last signature that rode it.
+    #[test]
+    fn one_sign_in_a_day_across_every_place() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let frizz = scope("/src/frizz", "github.com", "git@github.com:me/frizz.git");
+        let mut a = HashMap::new();
+
+        let first = decide(true, DAY, 0.0, &keyward, &mut a, NOW);
+        assert_eq!((&first.reach, first.window, first.live), (&Reach::Everywhere, DAY, false));
+        assert_eq!(first.signing_in.as_deref(), Some("24 hours"), "the sheet and the card say so");
+        assert_eq!(first.unlock_reuse, 0.0, "a recent unlock of the Mac never answers a sign-in");
+        opened(&mut a, &first, NOW);
+
+        let late = NOW + DAY - 60.0;
+        let next = decide(true, DAY, 0.0, &frizz, &mut a, late);
+        assert!(next.live, "another repository, 23 hours 59 minutes on");
+        assert_eq!(next.signing_in, None, "only the request that signs in says so");
+        opened(&mut a, &next, late);
+        assert_eq!(a[&Reach::Everywhere], NOW, "riding a sign-in does not extend it");
+
+        let after = decide(true, DAY, 0.0, &keyward, &mut a, NOW + DAY);
+        assert!(!after.live, "a day from the sign-in, not from its last use");
+        assert_eq!(after.expired, vec![Reach::Everywhere], "the enclave lets go of its context");
+        assert_eq!(after.signing_in.as_deref(), Some("24 hours"));
+    }
+
+    /// A sign-in that was declined, or whose signature failed, opens nothing: the
+    /// next request asks again.
+    #[test]
+    fn a_sign_in_that_did_not_go_through_leaves_nobody_signed_in() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let mut a = HashMap::new();
+        let declined = decide(true, DAY, 0.0, &keyward, &mut a, NOW);
+        assert!(declined.signing_in.is_some());
+        // No `opened`: the signature never happened.
+        let again = decide(true, DAY, 0.0, &keyward, &mut a, NOW + 1.0);
+        assert!(!again.live);
+        assert!(again.signing_in.is_some());
+    }
+
+    /// `require_approval: false` is the daemon not asking at all, so there is no
+    /// sign-in to hold a context for, whatever `sign_in_secs` says.
+    #[test]
+    fn with_require_approval_off_there_is_no_sign_in() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let mut a = HashMap::new();
+        let plan = decide(false, DAY, 0.0, &keyward, &mut a, NOW);
+        assert_eq!(plan.reach, Reach::Place(keyward.clone()));
+        assert_eq!(plan.window, 0.0, "nothing is held");
+        assert_eq!(plan.signing_in, None);
+        opened(&mut a, &plan, NOW);
+        assert!(a.is_empty());
+
+        let windowed = decide(false, DAY, 300.0, &keyward, &mut a, NOW);
+        assert_eq!((windowed.reach, windowed.window), (Reach::Place(keyward), 300.0));
+    }
+
+    /// `sign_in_secs: 0`, as the daemon decides it: one place's approval says
+    /// nothing about a sign-in, lets a recent unlock stand in as it always did, and
+    /// leaves the next place to ask for itself.
+    #[test]
+    fn place_by_place_nothing_about_a_sign_in_applies() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let frizz = scope("/src/frizz", "github.com", "git@github.com:me/frizz.git");
+        let mut a = HashMap::new();
+
+        let first = decide(true, 0.0, 300.0, &keyward, &mut a, NOW);
+        assert_eq!((first.signing_in.as_deref(), first.unlock_reuse), (None, 300.0));
+        opened(&mut a, &first, NOW);
+        assert!(decide(true, 0.0, 300.0, &keyward, &mut a, NOW + 10.0).live);
+        assert!(!decide(true, 0.0, 300.0, &frizz, &mut a, NOW + 10.0).live);
+
+        let every_time = decide(true, 0.0, 0.0, &keyward, &mut HashMap::new(), NOW);
+        assert_eq!((every_time.window, every_time.live), (0.0, false));
+    }
+
+    /// A length nobody meant falls back to asking, never to a sign-in without end.
+    #[test]
+    fn a_nonsense_length_is_no_sign_in() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        for secs in [-1.0, f64::NAN] {
+            let plan = decide(true, secs, 0.0, &keyward, &mut HashMap::new(), NOW);
+            assert_eq!((plan.reach, plan.window), (Reach::Place(keyward.clone()), 0.0), "{secs}");
+        }
+    }
+
+    /// A clock that cannot be read is NaN, and then nobody is signed in.
+    #[test]
+    fn an_unreadable_clock_asks() {
+        let mut a = approved(&[(&Reach::Everywhere, NOW)]);
+        let plan = decide(true, DAY, 0.0, &Scope::default(), &mut a, f64::NAN);
+        assert!(!plan.live);
+        assert!(plan.signing_in.is_some());
+    }
+
+    #[test]
+    fn the_sheet_names_the_span_in_its_largest_whole_unit() {
+        assert_eq!(span(86400.0), "24 hours");
+        assert_eq!(span(7.0 * 86400.0), "7 days");
+        assert_eq!(span(3600.0), "1 hour");
+        assert_eq!(span(5400.0), "90 minutes");
+        assert_eq!(span(60.0), "1 minute");
+        assert_eq!(span(45.0), "45 seconds");
     }
 }
 

@@ -41,6 +41,11 @@ pub struct Event {
     pub scope: Option<crate::agent::Scope>,
     #[serde(default)]
     pub reused: bool,
+    /// True when the approval in play was a sign-in, which covers every place
+    /// rather than `scope` alone: with `reused` false this request signed in, with
+    /// it true this request rode that sign-in.
+    #[serde(default)]
+    pub sign_in: bool,
     pub outcome: String,
     pub duration_ms: u64,
 }

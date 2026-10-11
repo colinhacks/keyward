@@ -24,7 +24,8 @@ extern "C" {
         msg: *const u8,
         msg_len: usize,
         reason: *const i8,
-        reuse_seconds: f64,
+        hold: i32,
+        unlock_reuse_seconds: f64,
         scope: *const i8,
         approve: i32,
         buf: *mut u8,
@@ -174,18 +175,30 @@ impl Enclave {
     ///
     /// CryptoKit hashes with SHA-256 internally, which is what
     /// `ecdsa-sha2-nistp256` requires, and returns a raw r||s pair.
-    /// Forget the cached authentication for `scope`, so its next `sign` prompts even
-    /// inside a window. Other scopes keep theirs.
+    /// Forget the held authentication for `scope`, so its next `sign` prompts. Other
+    /// scopes keep theirs. Nothing here expires by itself: the daemon keeps the
+    /// clock and calls this when an approval has run out.
     pub fn forget(&self, scope: &str) {
         let c_scope = CString::new(scope).unwrap_or_default();
         unsafe { kwse_forget(c_scope.as_ptr()) }
     }
 
-    /// `scope` keys the cached authentication: each scope holds its own, so an
+    /// `scope` keys the held authentication: each scope holds its own, so an
     /// approval in one place neither covers nor evicts an approval in another.
+    /// `hold` keeps the context this signature authenticates for the signatures
+    /// that follow, until `forget`. `unlock_reuse_secs` lets a Touch ID unlock of
+    /// the Mac that recent stand in for the prompt; 0 always asks.
     /// `approve` false skips the daemon's own Touch ID check; a key created with a
     /// presence policy still makes the enclave ask on its own.
-    pub fn sign(&self, data: &[u8], reason: &str, reuse_secs: f64, scope: &str, approve: bool) -> Result<Vec<u8>, String> {
+    pub fn sign(
+        &self,
+        data: &[u8],
+        reason: &str,
+        scope: &str,
+        hold: bool,
+        unlock_reuse_secs: f64,
+        approve: bool,
+    ) -> Result<Vec<u8>, String> {
         let c_reason = CString::new(reason).unwrap_or_else(|_| CString::new("").unwrap());
         let c_scope = CString::new(scope).unwrap_or_default();
         let mut sig = vec![0u8; 256];
@@ -196,7 +209,8 @@ impl Enclave {
                 data.as_ptr(),
                 data.len(),
                 c_reason.as_ptr(),
-                reuse_secs,
+                hold as i32,
+                unlock_reuse_secs,
                 c_scope.as_ptr(),
                 approve as i32,
                 sig.as_mut_ptr(),

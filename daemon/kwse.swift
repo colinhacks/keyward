@@ -27,41 +27,48 @@ private func accessControl(_ policy: Int32) -> SecAccessControl? {
     return SecAccessControlCreateWithFlags(nil, accessible, flags, nil)
 }
 
-/// A reuse window only has effect within a single LAContext — a fresh context
-/// per signature always re-authenticates. Holding one for the length of the
-/// window is what actually turns "once per host" into "once per window".
+/// An authentication only carries over within a single LAContext — a fresh context
+/// per signature always re-authenticates. Holding one for as long as the approval
+/// lasts is what actually turns "once per host" into "once per window", and "once
+/// per signature" into "once a day".
 ///
 /// One context per scope, keyed by the daemon. A single shared context meant two
 /// agents working in two repositories evicted each other: every request from one
 /// dropped the other's approval, so alternating fetches prompted every time.
+///
+/// Nothing here keeps time. The daemon owns the only clock and calls `forget` when
+/// an approval runs out. A second clock in here ran out first — by as long as the
+/// prompt had been on screen, and by however long the Mac had slept — and a request
+/// in that gap prompted while the daemon logged it as reused.
 private final class ContextCache {
     static let shared = ContextCache()
     private let lock = NSLock()
-    private var held: [String: (ctx: LAContext, born: Date)] = [:]
+    private var held: [String: LAContext] = [:]
 
     /// Returns the context for `scope` and whether it is new. A new context has to
     /// be authenticated explicitly before it signs: the prompt the enclave raises on
     /// its own does not start the reuse clock, so the next request in the window
     /// prompted a second time and only the third was silent.
     ///
-    /// The context is cached whenever a window exists, including on the request
-    /// that opens it: an approval given outside every scope used to build a
-    /// context that was never kept, so the very next in-scope request prompted
-    /// again. The daemon calls `forget` first when the request is out of scope.
-    func take(scope: String, reuse: Double) -> (LAContext, Bool) {
+    /// With `hold` the context is kept, including on the request that opens the
+    /// window: an approval given outside every scope used to build a context that
+    /// was never kept, so the very next in-scope request prompted again. The daemon
+    /// calls `forget` first when no live approval covers the request.
+    ///
+    /// `unlockReuse` is macOS's own reuse: a Touch ID unlock of the Mac within that
+    /// many seconds (300 at most) answers the prompt without it being shown.
+    func take(scope: String, hold: Bool, unlockReuse: Double) -> (LAContext, Bool) {
         lock.lock()
         defer { lock.unlock() }
-        let now = Date()
-        held = held.filter { now.timeIntervalSince($0.value.born) < reuse }
-        if reuse > 0, let h = held[scope] {
-            return (h.ctx, false)
+        if hold, let c = held[scope] {
+            return (c, false)
         }
         let c = LAContext()
-        if reuse > 0 {
+        if unlockReuse > 0 {
             c.touchIDAuthenticationAllowableReuseDuration =
-                min(reuse, LATouchIDAuthenticationMaximumAllowableReuseDuration)
-            held[scope] = (c, now)
+                min(unlockReuse, LATouchIDAuthenticationMaximumAllowableReuseDuration)
         }
+        if hold { held[scope] = c }
         return (c, true)
     }
 
@@ -120,7 +127,7 @@ public func kwse_keychain_store(_ blob: UnsafePointer<UInt8>, _ len: Int, _ forc
     return 0
 }
 
-/// Drop the cached authentication for one scope: its next signature prompts whatever the window.
+/// Drop the held authentication for one scope: its next signature prompts.
 @_cdecl("kwse_forget")
 public func kwse_forget(_ scope: UnsafePointer<CChar>) {
     ContextCache.shared.forget(scope: String(cString: scope))
@@ -148,15 +155,16 @@ public func kwse_public(_ blob: UnsafePointer<UInt8>, _ blobLen: Int,
 public func kwse_sign(_ blob: UnsafePointer<UInt8>, _ blobLen: Int,
                       _ msg: UnsafePointer<UInt8>, _ msgLen: Int,
                       _ reason: UnsafePointer<CChar>?,
-                      _ reuseSeconds: Double,
+                      _ hold: Int32,
+                      _ unlockReuseSeconds: Double,
                       _ scope: UnsafePointer<CChar>,
                       _ approve: Int32,
                       _ buf: UnsafeMutablePointer<UInt8>, _ cap: Int) -> Int {
     let d = Data(bytes: blob, count: blobLen)
-    // Consecutive signatures within the window share one authentication, so a
+    // Consecutive signatures under one approval share one authentication, so a
     // loop over the fleet asks once rather than once per host.
     let key = String(cString: scope)
-    let (ctx, fresh) = ContextCache.shared.take(scope: key, reuse: reuseSeconds)
+    let (ctx, fresh) = ContextCache.shared.take(scope: key, hold: hold != 0, unlockReuse: unlockReuseSeconds)
     var text = ""
     if let reason, let t = String(validatingUTF8: reason), !t.isEmpty {
         // This is the whole point: Keyward writes the Touch ID prompt, so it can

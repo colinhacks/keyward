@@ -85,7 +85,8 @@ noticed, because `KeepAlive.Crashed` only sees a process that died.
     { "name": "gpg-agent", "path": "~/.gnupg/S.gpg-agent.ssh" }
   ],
   "timeout_secs": 10,
-  "max_log_bytes": 33554432
+  "max_log_bytes": 33554432,
+  "sign_in_secs": 86400
 }
 ```
 
@@ -178,7 +179,7 @@ the request is for, so the prompt reads:
 | `presence` | Touch ID, password fallback | no | yes |
 | `biometry` | Touch ID only | no | **no — the key is destroyed** |
 
-The daemon asks on its own as well: a request from a place with no live approval raises Touch ID whatever the key's policy. `"require_approval": false` in the config turns that off, and with a `none` key nothing asks at all, so agents can push while you are away. A `presence` or `biometry` key is created usable only while the Mac is unlocked, and refuses every signature on a locked screen with `-25308`; a `none` key is created usable after the first unlock, because unattended signing is what it is for.
+The daemon asks on its own as well: a request that arrives with no live sign-in (below) raises Touch ID whatever the key's policy. `"require_approval": false` in the config turns that off, and with a `none` key nothing asks at all, so agents can push while you are away. A `presence` or `biometry` key is created usable only while the Mac is unlocked, and refuses every signature on a locked screen with `-25308`; a `none` key is created usable after the first unlock, because unattended signing is what it is for.
 
 ### The trade-off, stated plainly
 
@@ -196,8 +197,7 @@ With a signing certificate, the keychain route is open here too: set
 `"enclave_key": "keychain"` in the config before `--generate-key`, and the handle is
 stored in the login keychain as an item only keywardd's own code signature can read
 without a prompt. That is the setting that makes a `none` key reasonable: nothing gets
-to the key except through the daemon, so the daemon's approval window (below) is the
-gate, and it can be as long as you like instead of Apple's five minutes.
+to the key except through the daemon, so the daemon's sign-in (below) is the gate.
 
 ### There is no backup
 
@@ -239,14 +239,58 @@ Sign a commit in nixos-config · Claude
 git push to owner/repo · Ghostty
 ```
 
-`touch_id_reuse_secs` (config, 0 = every signature) holds one authenticated
-`LAContext` for that long, so a loop over the fleet asks once instead of once per
-host. The window is scoped: it covers requests from the same directory, to the same
-host and remote as the approval, and anything else prompts. Each place keeps its own window, so agents working in several repositories at once do not reset one another, and a linked worktree counts as the clone it came from. A fresh context is
-authenticated explicitly before it signs — the prompt the enclave raises on its own
-does not start the reuse clock. With a `presence` or `biometry` key macOS caps the
-window at 300 seconds; with a `none` key kept in the keychain the window is the
-daemon's alone (86400 for a day).
+## Signing in
+
+Keyward asks once a day. The first request for its own key raises Touch ID, and that
+sign-in covers every signature with that key for the next 24 hours — any repository,
+any host, any agent — so work spread across a dozen checkouts costs one prompt rather
+than one per place. The sheet names the grant before the request that happened to
+raise it, and the card's first row says the same:
+
+```
+Sign in for 24 hours · git push to owner/repo
+```
+
+A key held by an upstream agent is that agent's to guard, and prompts the way it
+always did.
+
+`sign_in_secs` (config, 86400 by default) sets how long it lasts. The time runs from
+the sign-in itself, on a clock that keeps counting while the Mac sleeps, and the
+signatures that ride it do not extend it. The first request after it runs out signs in
+again.
+
+While it lasts nothing asks: anything that can reach the socket gets its signature,
+which is every process running as you and any host the agent was forwarded to. Each
+one is still logged with the place it came from. On an event, `sign_in` marks a
+request made under a sign-in, and `reused` says whether it rode one or was the request
+that asked. The sign-in lives in the daemon's memory, so restarting the daemon signs
+out:
+
+```sh
+launchctl kickstart -k "gui/$(id -u)/dev.danielsol.keyward.agent"
+```
+
+It is the daemon's own check, so `"require_approval": false` leaves nothing to sign in
+to. Underneath it is one `LAContext`, authenticated explicitly and held for as long as
+the sign-in lasts; a `presence` or `biometry` key signs through that context. Signing
+in always asks: macOS can let a Touch ID unlock of the Mac in the last five minutes
+answer a prompt without showing it (`touchIDAuthenticationAllowableReuseDuration`), and
+a sign-in does not use that. `sheet_reason` in the config replaces the request on the
+sheet, never the sign-in.
+
+A config that fails to parse runs on the defaults without the sign-in, asking for
+every signature, so a typo cannot turn into a day's grant.
+
+### Approving place by place instead
+
+`"sign_in_secs": 0` turns the sign-in off, and each place is approved on its own.
+`touch_id_reuse_secs` (0 = every signature; it does nothing while there is a sign-in)
+then holds one authenticated context per place for that long, so a loop over the fleet
+asks once instead of once per host. The window is scoped: it covers requests from the
+same directory, to the same host and remote as the approval, and anything else prompts. Each place keeps its own window, so
+agents working in several repositories at once do not reset one another, and a linked
+worktree counts as the clone it came from. Here a Touch ID unlock within the window,
+up to macOS's five minutes, can stand in for the prompt.
 
 ## Never overwrite the daemon in place
 

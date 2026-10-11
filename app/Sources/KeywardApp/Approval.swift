@@ -23,6 +23,8 @@ struct PendingSignature: Codable {
     var commitCount: Int?
     var stat: String?
     var upstream: String?
+    /// Set when approving this request signs in: how long that lasts ("24 hours").
+    var signIn: String?
 
     var isPush: Bool { commitCount != nil || !(commits ?? []).isEmpty }
 }
@@ -137,6 +139,10 @@ struct ApprovalView: View {
     /// untrimmed process chain — lives in the app window, where there is room.
     private var rows: [Row] {
         var out: [Row] = []
+        // First, because it reaches past everything below: this approval is not for one request.
+        if let span = ctx.signIn {
+            out.append(.field(Field(label: "Sign-in", value: "Covers every repository and host for \(span)", mono: false)))
+        }
         if let s = ctx.subject { out.append(.field(Field(label: "Commit", value: s, mono: false, lines: 2))) }
         if ctx.isPush { out.append(.changes) }
         // A multi-line script gets its own block above, not a squashed row.
@@ -337,6 +343,7 @@ struct ApprovalView: View {
             h += 13 + 5 + 22 + CGFloat(visual) * 17 + (all.count > shown.count ? 18 : 0) + 11
         }
         var rows = 0
+        if ctx.signIn != nil { rows += 1 }
         if ctx.subject != nil { rows += 1 }
         if ctx.isPush { rows += 1 }
         if let c = ctx.command, !isMultilineCommand(c) { rows += 1 }
