@@ -241,7 +241,7 @@ git push to owner/repo · Ghostty
 
 ## Signing in
 
-Keyward asks once a day. The first request for its own key raises Touch ID, and that
+Keyward's own check asks once a day. The first request for its own key raises Touch ID, and that
 sign-in covers every signature with that key for the next 24 hours — any repository,
 any host, any agent — so work spread across a dozen checkouts costs one prompt rather
 than one per place. The sheet names the grant before the request that happened to
@@ -272,11 +272,19 @@ launchctl kickstart -k "gui/$(id -u)/dev.danielsol.keyward.agent"
 
 It is the daemon's own check, so `"require_approval": false` leaves nothing to sign in
 to. Underneath it is one `LAContext`, authenticated explicitly and held for as long as
-the sign-in lasts; a `presence` or `biometry` key signs through that context. Signing
-in always asks: macOS can let a Touch ID unlock of the Mac in the last five minutes
-answer a prompt without showing it (`touchIDAuthenticationAllowableReuseDuration`), and
-a sign-in does not use that. `sheet_reason` in the config replaces the request on the
-sheet, never the sign-in.
+the sign-in lasts. Signing in always asks: macOS can let a Touch ID unlock of the Mac
+in the last five minutes answer a prompt without showing it
+(`touchIDAuthenticationAllowableReuseDuration`), and a sign-in does not use that.
+`sheet_reason` in the config replaces the request on the sheet, never the sign-in.
+
+**A `presence` or `biometry` key is still asked for about every ten minutes.** The
+enclave guards those keys itself, and it accepts one authentication for about ten
+minutes however long the daemon holds the context. The first signature after that
+raises the enclave's own prompt, which names that request and says nothing of a
+sign-in, and the event is logged as `reused` because the daemon did not ask. Measured
+on macOS 26.6: signatures 9m47s and 8m00s after an authentication were silent, ones
+11m41s and 10m09s after were asked, and the silent signatures in between did not
+extend it. Only a `none` key gets one prompt a day.
 
 A config that fails to parse runs on the defaults without the sign-in, asking for
 every signature, so a typo cannot turn into a day's grant.

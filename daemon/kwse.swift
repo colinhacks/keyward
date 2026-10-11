@@ -30,7 +30,9 @@ private func accessControl(_ policy: Int32) -> SecAccessControl? {
 /// An authentication only carries over within a single LAContext — a fresh context
 /// per signature always re-authenticates. Holding one for as long as the approval
 /// lasts is what actually turns "once per host" into "once per window", and "once
-/// per signature" into "once a day".
+/// per signature" into "once a day". The enclave has the last word on a key it
+/// guards itself: a presence or biometry key is asked for again about ten minutes
+/// after each authentication, whatever is held here.
 ///
 /// One context per scope, keyed by the daemon. A single shared context meant two
 /// agents working in two repositories evicted each other: every request from one
