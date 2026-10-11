@@ -59,7 +59,10 @@ PLIST
 # Documents/Desktop grant the daemon needs to read a repository is lost each time; any
 # stable certificate (`security find-identity -v -p codesigning`) keeps it.
 sign="${CODESIGN_IDENTITY:--}"
-codesign --force --sign "$sign" --timestamp=none "$app/Contents/MacOS/keywardd" >/dev/null 2>&1
+# The daemon gets the hardened runtime: while somebody is signed in with a sign-in key
+# it holds the secret that key signs for, and without this a debugger may attach to it
+# and read that out of its memory.
+codesign --force --sign "$sign" --timestamp=none --options runtime "$app/Contents/MacOS/keywardd" >/dev/null 2>&1
 codesign --force --sign "$sign" --timestamp=none "$app" >/dev/null 2>&1 || \
   echo "    (codesign failed; app still runs, notifications may not)"
 

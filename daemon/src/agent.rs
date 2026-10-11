@@ -1,7 +1,7 @@
 //! The proxy itself.
 
 use crate::attrib::{self, Attribution};
-use crate::enclave::Enclave;
+use crate::enclave::{Enclave, Screen};
 use crate::purpose::Kind as PurposeKind;
 use crate::event::{Event, Kind, Log};
 use crate::upstream::Upstream;
@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 pub const FAILURE: u8 = 5;
@@ -58,6 +58,13 @@ pub struct Ctx {
     /// further requests from the same place, and every place keeps its own: two
     /// agents in two repositories must not evict each other's approval.
     pub approved: Mutex<HashMap<Reach, f64>>,
+    /// Counts sign-outs. A signature takes as long as the Touch ID it waits for, and
+    /// a sign-out that lands meanwhile must leave nothing of that request behind.
+    /// Changed and compared only with `approved` locked.
+    pub sign_outs: AtomicU64,
+    /// The last look at the screen, by the watch or by a request. Only a sign-in
+    /// key looks.
+    pub looked: Mutex<Look>,
     /// Every connection runs on its own thread, and two Touch ID prompts at once
     /// cancel each other ("Canceled by another authentication"), so signatures
     /// take turns: the second request waits for the first prompt to finish, and
@@ -110,7 +117,7 @@ fn scope_of(who: &Attribution) -> Scope {
 /// What one approval covers.
 ///
 /// A sign-in is the deliberate exception to the scoping above: the user is asked
-/// for a day's worth of signatures everywhere, the prompt and the card say so, and
+/// for hours of signatures everywhere, the prompt and the card say so, and
 /// that is the authorisation they give.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Reach {
@@ -140,12 +147,21 @@ fn grant(sign_in_secs: f64, reuse_secs: f64, place: &Scope) -> (Reach, f64) {
 }
 
 /// A poisoned lock must never take SSH down; the worst it costs is one more prompt.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The lock, if nobody holds it.
+fn idle<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 /// Seconds on a clock that keeps counting while the Mac sleeps. `Instant` stops
-/// then, so a sign-in measured with it lasted a day of waking time, not a day.
+/// then, so a sign-in measured with it lasted six hours of waking time, not six hours.
 ///
 /// NaN when the clock cannot be read: every comparison with it is false, so
 /// nothing counts as live and every request asks.
@@ -191,6 +207,34 @@ fn span(secs: f64) -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
+/// When the sign-in a request opens will end.
+#[derive(Debug, Clone, PartialEq)]
+enum Ends {
+    /// After this many seconds.
+    After(f64),
+    /// When the screen locks, which is where a sign-in key's sign-in stops, or
+    /// after this many seconds if it never does.
+    AtScreenLock(f64),
+}
+
+impl Ends {
+    /// On the sheet, where every character comes out of the request beside it.
+    fn sheet(&self) -> String {
+        match self {
+            Ends::After(secs) => format!("for {}", span(*secs)),
+            Ends::AtScreenLock(_) => "until screen lock".to_string(),
+        }
+    }
+
+    /// On the card, which has room for both ends.
+    fn card(&self) -> String {
+        match self {
+            Ends::After(_) => self.sheet(),
+            Ends::AtScreenLock(secs) => format!("for {} or until the screen locks", span(*secs)),
+        }
+    }
+}
+
 /// What one request needs, settled before the enclave is touched.
 #[derive(Debug, PartialEq)]
 struct Plan {
@@ -202,25 +246,26 @@ struct Plan {
     live: bool,
     /// Approvals that ran out. The enclave still holds a context for each.
     expired: Vec<Reach>,
-    /// How long the sign-in this request opens will last, when it opens one. Only
-    /// that request says so, on the sheet and on the card.
-    signing_in: Option<String>,
+    /// When the sign-in this request opens will end, when it opens one. Only that
+    /// request says so, on the sheet and on the card.
+    signing_in: Option<Ends>,
     /// Seconds within which a Touch ID unlock of the Mac may answer the prompt
     /// without it being shown. A place allows it, as it always has. A sign-in
-    /// never does: a day everywhere is not handed out unseen.
+    /// never does: hours everywhere are not handed out unseen.
     unlock_reuse: f64,
 }
 
 /// Kept pure, like the arithmetic above, so the rules are testable without an enclave.
 ///
 /// The sign-in is the daemon's own check. With `approve` off there is none: holding
-/// a context for a day then would let the one prompt a presence key raises by
-/// itself, which names a single action, cover a day of signatures nobody was
+/// a context for hours then would let the one prompt a presence key raises by
+/// itself, which names a single action, cover hours of signatures nobody was
 /// asked about.
 fn decide(
     approve: bool,
     sign_in_secs: f64,
     reuse_secs: f64,
+    ends_at_lock: bool,
     place: &Scope,
     approved: &mut HashMap<Reach, f64>,
     now: f64,
@@ -229,8 +274,9 @@ fn decide(
     let expired = expire(approved, window, now);
     let live = reuse_covers(approved, &reach, window, now);
     let everywhere = reach == Reach::Everywhere;
+    let ends = if ends_at_lock { Ends::AtScreenLock(window) } else { Ends::After(window) };
     Plan {
-        signing_in: (everywhere && !live).then(|| span(window)),
+        signing_in: (everywhere && !live).then_some(ends),
         unlock_reuse: if everywhere { 0.0 } else { window },
         reach,
         window,
@@ -240,12 +286,149 @@ fn decide(
 }
 
 /// A signature went through. The approval it opened starts now; one it rode
-/// stays where it was opened, so a sign-in is a day from the sign-in and not a
-/// day from its last use.
+/// stays where it was opened, so a sign-in is six hours from the sign-in and not
+/// six hours from its last use.
 fn opened(approved: &mut HashMap<Reach, f64>, plan: &Plan, now: f64) {
     if !plan.live && plan.window > 0.0 {
         approved.insert(plan.reach.clone(), now);
     }
+}
+
+/// The daemon's half of a sign-out: every approval, and the count `admit` reads.
+/// Says whether anybody was signed in.
+fn end_approvals(ctx: &Ctx) -> bool {
+    let mut approved = lock(&ctx.approved);
+    ctx.sign_outs.fetch_add(1, Ordering::SeqCst);
+    !std::mem::take(&mut *approved).is_empty()
+}
+
+/// Nobody is signed in any more, anywhere. Says whether anybody was.
+fn sign_out(ctx: &Ctx, e: &Enclave) -> bool {
+    let was = end_approvals(ctx);
+    e.forget_all();
+    was
+}
+
+/// Record the approval a signature opened. False when everybody was signed out while
+/// it was being made: the Touch ID it waited for may have been given before the screen
+/// locked, so neither the approval nor the signature may be kept.
+fn admit(ctx: &Ctx, plan: &Plan, sign_outs: u64) -> bool {
+    let mut approved = lock(&ctx.approved);
+    if ctx.sign_outs.load(Ordering::SeqCst) != sign_outs {
+        return false;
+    }
+    opened(&mut approved, plan, clock());
+    true
+}
+
+/// One look at the screen: when, on `clock`, and what was there.
+pub struct Look {
+    at: f64,
+    saw: Screen,
+}
+
+impl Look {
+    /// What stands in for a look before there has been one.
+    pub fn first() -> Look {
+        Look { at: clock(), saw: Screen::Unlocked }
+    }
+}
+
+/// How often the watch looks at the screen.
+const LOOK_EVERY: Duration = Duration::from_secs(1);
+
+/// Whether too long went by between two looks to say the screen stayed unlocked. The
+/// watch looks every second, so a gap means the daemon was not running: the Mac slept,
+/// and can have been locked and unlocked again before anything here woke. A clock
+/// that cannot be read is a gap.
+fn unseen(last: f64, now: f64) -> bool {
+    !(now - last < 3.0)
+}
+
+/// One look at the screen, for a sign-in key. Anything but an unlocked screen signs
+/// everybody out, and so does a gap since the last look. The log gets a line when
+/// the screen changes, which is also how a lock that stopped being seen would show.
+fn look(ctx: &Ctx, e: &Enclave) -> Screen {
+    // Held to the end. Once this look is recorded the next one takes the screen as
+    // watched, so it must not get in before the sign-out this one calls for.
+    let mut looked = lock(&ctx.looked);
+    let now = clock();
+    let screen = crate::enclave::screen();
+    let before = std::mem::replace(&mut *looked, Look { at: now, saw: screen });
+    if screen != before.saw {
+        eprintln!("keywardd: {}", screen.refusal().unwrap_or("screen unlocked"));
+    }
+    if (screen != Screen::Unlocked || unseen(before.at, now)) && sign_out(ctx, e) {
+        match screen.refusal() {
+            Some(why) => eprintln!("keywardd: signed out ({why})"),
+            None => eprintln!(
+                "keywardd: signed out (not watching for {:.0}s, long enough to hide a lock)",
+                now - before.at
+            ),
+        }
+    }
+    screen
+}
+
+/// Why this key may not sign with the screen as it is, if it may not. Only a sign-in
+/// key is held to the screen; the older kinds keep what their own policy gives them.
+fn barred(ctx: &Ctx, e: &Enclave) -> Option<&'static str> {
+    if !e.ends_at_lock {
+        return None;
+    }
+    look(ctx, e).refusal()
+}
+
+/// What has run out is let go of by the enclave too, and the log says when that was
+/// a sign-in.
+fn release(e: &Enclave, gone: &[Reach], window: f64) {
+    for reach in gone {
+        e.forget(&reach.key());
+        if *reach == Reach::Everywhere {
+            eprintln!("keywardd: signed out (after {})", span(window));
+        }
+    }
+}
+
+/// Lives as long as the screen watch does. A watch that stopped would leave a daemon
+/// that looks alive and signs nobody in: every request would find the screen
+/// unwatched and sign out, its own sign-in included. So the daemon goes with it, and
+/// launchd starts one that watches.
+struct Watching;
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let _ = writeln!(io::stderr(), "keywardd: the screen watch stopped; exiting so launchd restarts it");
+        std::process::exit(1);
+    }
+}
+
+/// A sign-in key's sign-in ends when the screen locks. The lock is read once a second
+/// rather than waited for: the notification macOS posts for it needs a run loop this
+/// daemon does not have, and is not promised to arrive. `handle_sign` looks too, before
+/// and after every signature, so a lock too brief to be seen here still cannot be
+/// signed through while it lasts.
+pub fn watch_screen(ctx: Arc<Ctx>) {
+    std::thread::spawn(move || {
+        let Some(e) = ctx.enclave.as_ref() else { return };
+        let _watching = Watching;
+        let (_, window) = grant(
+            if ctx.require_approval { ctx.sign_in_secs } else { 0.0 },
+            ctx.touch_id_reuse_secs,
+            &Scope::default(),
+        );
+        loop {
+            std::thread::sleep(LOOK_EVERY);
+            look(&ctx, e);
+            // What has run out is let go of here as well as at the next request, so a
+            // secret does not sit in memory waiting for one. Never under a signature:
+            // the request in flight decided with the approvals as they were.
+            if let Some(_turn) = idle(&ctx.sign_gate) {
+                let gone = expire(&mut lock(&ctx.approved), window, clock());
+                release(e, &gone, window);
+            }
+        }
+    });
 }
 
 pub fn fingerprint(blob: &[u8]) -> String {
@@ -307,17 +490,18 @@ fn prompt_action(who: &Attribution) -> String {
 /// the app, the command and the key, so repeating any of it here just makes the
 /// small panel wordier than the big one.
 ///
-/// `sign_in` is how long the sign-in this prompt opens will last. That approval
-/// reaches past the action that raised it, so the sheet leads with it.
+/// `sign_in` is when the sign-in this prompt opens will end, as `Ends::sheet` puts
+/// it. That approval reaches past the action that raised it, so the sheet leads
+/// with it.
 fn sheet_reason(who: &Attribution, configured: &str, sign_in: Option<&str>) -> String {
     let configured = (!configured.is_empty()).then(|| sanitise(configured));
     // A configured text may replace the action, never the sign-in: the sheet is
     // the one place the grant is certain to be read, the card being best-effort.
-    if let Some(span) = sign_in {
+    if let Some(ends) = sign_in {
         let rest = configured.unwrap_or_else(|| prompt_action(who));
         let said = match rest.as_str() {
-            "" => format!("Sign in for {span}"),
-            rest => format!("Sign in for {span} · {rest}"),
+            "" => format!("Sign in {ends}"),
+            rest => format!("Sign in {ends} · {rest}"),
         };
         return crate::purpose::shorten(&said, PROMPT_MAX);
     }
@@ -455,43 +639,73 @@ fn handle_sign(ctx: &Ctx, payload: &[u8], who: &Attribution, bound: &Option<Stri
             let scope = scope_of(who);
             let approve = ctx.require_approval;
             let _turn = lock(&ctx.sign_gate);
+            // A sign-in key signs nothing on a locked screen, and its sign-in does not
+            // outlive one. `watch_screen` ends it within a second of the lock; this is
+            // the same look at the moment it matters, and it refuses without raising
+            // a sheet nobody is there to see.
+            let refused = barred(ctx, e);
+            let sign_outs = ctx.sign_outs.load(Ordering::SeqCst);
             let plan = decide(
                 approve,
                 ctx.sign_in_secs,
                 ctx.touch_id_reuse_secs,
+                e.ends_at_lock,
                 &scope,
                 &mut lock(&ctx.approved),
                 clock(),
             );
             let key = plan.reach.key();
-            for gone in &plan.expired {
-                e.forget(&gone.key());
-            }
+            release(e, &plan.expired, plan.window);
             if !plan.live {
                 e.forget(&key);
             }
             let reused = approve && plan.live;
-            let signing_in = plan.signing_in.as_deref();
-            let reason = sheet_reason(who, &ctx.sheet_reason, signing_in);
-
-            let card = approve
-                .then(|| crate::ui::show(who, &headline, Some(&e.comment), Some(&fp), signing_in));
-            let signed = e.sign(&data, &reason, &key, plan.window > 0.0, plan.unlock_reuse, approve);
-            if let Some(card) = card {
-                card.done();
-            }
+            let signed = match refused {
+                Some(why) => Err(why.to_string()),
+                None => {
+                    let on_sheet = plan.signing_in.as_ref().map(Ends::sheet);
+                    let on_card = plan.signing_in.as_ref().map(Ends::card);
+                    let reason = sheet_reason(who, &ctx.sheet_reason, on_sheet.as_deref());
+                    let card = approve.then(|| {
+                        crate::ui::show(who, &headline, Some(&e.comment), Some(&fp), on_card.as_deref())
+                    });
+                    let signed = e.sign(
+                        &data,
+                        &reason,
+                        &key,
+                        plan.window > 0.0,
+                        plan.unlock_reuse,
+                        approve,
+                        plan.live,
+                    );
+                    if let Some(card) = card {
+                        card.done();
+                    }
+                    // The card and the sheet take time, and the screen can lock under
+                    // either. A signature made by then stays here.
+                    match barred(ctx, e) {
+                        Some(why) => Err(why.to_string()),
+                        None => signed,
+                    }
+                }
+            };
             let (reply, outcome) = match signed {
-                Ok(sig) => {
-                    opened(&mut lock(&ctx.approved), &plan, clock());
+                Ok(sig) if admit(ctx, &plan, sign_outs) => {
                     let mut w = Writer::new();
                     w.u8(SIGN_RESPONSE);
                     w.string(&sig);
                     (w.buf, "ok".to_string())
                 }
+                Ok(_) => {
+                    // The sign-out could not see what this request was holding.
+                    e.forget(&key);
+                    (failure(), "signed out while signing".to_string())
+                }
                 Err(err) => {
                     // The context this request built may have been authenticated
-                    // before the signature failed. No approval was opened to end it.
-                    if !plan.live {
+                    // before the signature failed, and a sign-out meanwhile could not
+                    // see it. No approval was opened to end it.
+                    if !plan.live || ctx.sign_outs.load(Ordering::SeqCst) != sign_outs {
                         e.forget(&key);
                     }
                     (failure(), err)
@@ -651,10 +865,17 @@ fn serve(mut stream: UnixStream, ctx: Arc<Ctx>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide, expire, grant, opened, reuse_covers, sheet_reason, span, PurposeKind, Reach, Scope};
+    use super::{
+        admit, decide, end_approvals, expire, grant, lock, opened, reuse_covers, sheet_reason, span,
+        unseen, Ctx, Ends, Look, PurposeKind, Reach, Scope, Screen,
+    };
     use crate::attrib::{AppInfo, Attribution};
+    use crate::event::Log;
     use crate::purpose::Purpose;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Mutex, RwLock};
+    use std::time::Duration;
 
     const DAY: f64 = 86400.0;
     /// Any reading of the daemon's clock; only differences matter.
@@ -827,10 +1048,10 @@ mod tests {
         let who = pushing("me/keyward.git");
         assert_eq!(sheet_reason(&who, "", None), "git push to me/keyward · Ghostty");
         assert_eq!(
-            sheet_reason(&who, "", Some("24 hours")),
+            sheet_reason(&who, "", Some("for 24 hours")),
             "Sign in for 24 hours · git push to me/keyward"
         );
-        let long = sheet_reason(&pushing("an-organisation/a-repository.git"), "", Some("24 hours"));
+        let long = sheet_reason(&pushing("an-organisation/a-repository.git"), "", Some("for 24 hours"));
         assert_eq!(long, "Sign in for 24 hours · git push to an-organisation/a-rep…");
     }
 
@@ -842,8 +1063,8 @@ mod tests {
         let who = pushing("me/keyward.git");
         assert_eq!(sheet_reason(&who, "Approve", None), "Approve");
         assert_eq!(sheet_reason(&who, " ", None), "");
-        assert_eq!(sheet_reason(&who, "Approve", Some("24 hours")), "Sign in for 24 hours · Approve");
-        assert_eq!(sheet_reason(&who, " ", Some("24 hours")), "Sign in for 24 hours");
+        assert_eq!(sheet_reason(&who, "Approve", Some("for 24 hours")), "Sign in for 24 hours · Approve");
+        assert_eq!(sheet_reason(&who, " ", Some("for 24 hours")), "Sign in for 24 hours");
     }
 
     /// The whole day, as the daemon decides it: the first request anywhere signs
@@ -855,23 +1076,114 @@ mod tests {
         let frizz = scope("/src/frizz", "github.com", "git@github.com:me/frizz.git");
         let mut a = HashMap::new();
 
-        let first = decide(true, DAY, 0.0, &keyward, &mut a, NOW);
+        let first = decide(true, DAY, 0.0, false, &keyward, &mut a, NOW);
         assert_eq!((&first.reach, first.window, first.live), (&Reach::Everywhere, DAY, false));
-        assert_eq!(first.signing_in.as_deref(), Some("24 hours"), "the sheet and the card say so");
+        assert_eq!(first.signing_in, Some(Ends::After(DAY)), "the sheet and the card say so");
         assert_eq!(first.unlock_reuse, 0.0, "a recent unlock of the Mac never answers a sign-in");
         opened(&mut a, &first, NOW);
 
         let late = NOW + DAY - 60.0;
-        let next = decide(true, DAY, 0.0, &frizz, &mut a, late);
+        let next = decide(true, DAY, 0.0, false, &frizz, &mut a, late);
         assert!(next.live, "another repository, 23 hours 59 minutes on");
         assert_eq!(next.signing_in, None, "only the request that signs in says so");
         opened(&mut a, &next, late);
         assert_eq!(a[&Reach::Everywhere], NOW, "riding a sign-in does not extend it");
 
-        let after = decide(true, DAY, 0.0, &keyward, &mut a, NOW + DAY);
+        let after = decide(true, DAY, 0.0, false, &keyward, &mut a, NOW + DAY);
         assert!(!after.live, "a day from the sign-in, not from its last use");
         assert_eq!(after.expired, vec![Reach::Everywhere], "the enclave lets go of its context");
-        assert_eq!(after.signing_in.as_deref(), Some("24 hours"));
+        assert_eq!(after.signing_in, Some(Ends::After(DAY)));
+    }
+
+    /// A sign-in key's sign-in stops at the screen lock. The sheet says that, and
+    /// the card, which has the room, says how long it lasts if the screen never locks.
+    #[test]
+    fn a_sign_in_key_signs_in_until_the_screen_locks() {
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+        let plan = decide(true, DAY, 0.0, true, &keyward, &mut HashMap::new(), NOW);
+        assert_eq!(plan.signing_in, Some(Ends::AtScreenLock(DAY)));
+        assert_eq!((&plan.reach, plan.window), (&Reach::Everywhere, DAY), "a day with no lock ends it too");
+        assert_eq!(
+            sheet_reason(&pushing("me/keyward.git"), "", Some(&Ends::AtScreenLock(DAY).sheet())),
+            "Sign in until screen lock · git push to me/keyward"
+        );
+        assert_eq!(Ends::AtScreenLock(21600.0).card(), "for 6 hours or until the screen locks");
+        assert_eq!((Ends::After(DAY).sheet(), Ends::After(DAY).card()), ("for 24 hours".into(), "for 24 hours".into()));
+
+        // The longer lead leaves the action less room, and it is the action that gives.
+        let long = sheet_reason(
+            &pushing("an-organisation/a-repository.git"),
+            "",
+            Some(&Ends::AtScreenLock(DAY).sheet()),
+        );
+        assert_eq!(long, "Sign in until screen lock · git push to an-organisation/…");
+    }
+
+    /// Only an unlocked screen has no reason to refuse, and the log says which of
+    /// the others it was.
+    #[test]
+    fn a_screen_that_is_not_unlocked_says_why() {
+        assert_eq!(Screen::Unlocked.refusal(), None);
+        assert_eq!(Screen::Locked.refusal(), Some("screen locked"));
+        assert_eq!(Screen::Away.refusal(), Some("not at the console"));
+        assert_eq!(Screen::Unreadable.refusal(), Some("screen state unreadable"));
+    }
+
+    /// The watch looks every second. When far longer than that went by the Mac was
+    /// asleep, and a lock can hide in a sleep.
+    #[test]
+    fn a_gap_between_looks_cannot_vouch_for_the_screen() {
+        assert!(!unseen(NOW, NOW + 1.0));
+        assert!(!unseen(NOW, NOW + 2.5), "a slow second is not a sleep");
+        assert!(unseen(NOW, NOW + 3.0));
+        assert!(unseen(NOW, NOW + 8.0 * 3600.0));
+        assert!(unseen(NOW, f64::NAN), "an unreadable clock vouches for nothing");
+        assert!(unseen(f64::NAN, NOW));
+    }
+
+    fn ctx() -> Ctx {
+        Ctx {
+            enclave: None,
+            upstreams: Vec::new(),
+            routes: RwLock::new(HashMap::new()),
+            comments: RwLock::new(HashMap::new()),
+            log: Log::new(std::env::temp_dir().join("keyward-test-events.jsonl"), 0),
+            timeout: Duration::from_secs(1),
+            conns: AtomicUsize::new(0),
+            log_lists: false,
+            sign_in_secs: DAY,
+            touch_id_reuse_secs: 0.0,
+            require_approval: true,
+            sheet_reason: String::new(),
+            approved: Mutex::new(HashMap::new()),
+            sign_outs: AtomicU64::new(0),
+            looked: Mutex::new(Look::first()),
+            sign_gate: Mutex::new(()),
+        }
+    }
+
+    /// A Touch ID sheet stays up for as long as it is left, and the screen can lock
+    /// under it. The sign-out that runs then cannot see what the request is about to
+    /// hold, so the request finds out when it comes back, and opens nothing.
+    #[test]
+    fn a_sign_out_during_a_signature_leaves_nobody_signed_in() {
+        let ctx = ctx();
+        let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
+
+        let before = ctx.sign_outs.load(Ordering::SeqCst);
+        let plan = decide(true, DAY, 0.0, true, &keyward, &mut lock(&ctx.approved), NOW);
+        assert!(!end_approvals(&ctx), "nobody was signed in yet");
+        assert!(!admit(&ctx, &plan, before), "the signature came back to a sign-out");
+        assert!(lock(&ctx.approved).is_empty());
+
+        // The next request starts from the count as it stands, and signs in.
+        let before = ctx.sign_outs.load(Ordering::SeqCst);
+        let plan = decide(true, DAY, 0.0, true, &keyward, &mut lock(&ctx.approved), NOW);
+        assert!(admit(&ctx, &plan, before));
+        assert!(lock(&ctx.approved).contains_key(&Reach::Everywhere));
+
+        assert!(end_approvals(&ctx), "a lock signs that out");
+        assert!(lock(&ctx.approved).is_empty());
     }
 
     /// A sign-in that was declined, or whose signature failed, opens nothing: the
@@ -880,10 +1192,10 @@ mod tests {
     fn a_sign_in_that_did_not_go_through_leaves_nobody_signed_in() {
         let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
         let mut a = HashMap::new();
-        let declined = decide(true, DAY, 0.0, &keyward, &mut a, NOW);
+        let declined = decide(true, DAY, 0.0, false, &keyward, &mut a, NOW);
         assert!(declined.signing_in.is_some());
         // No `opened`: the signature never happened.
-        let again = decide(true, DAY, 0.0, &keyward, &mut a, NOW + 1.0);
+        let again = decide(true, DAY, 0.0, false, &keyward, &mut a, NOW + 1.0);
         assert!(!again.live);
         assert!(again.signing_in.is_some());
     }
@@ -894,14 +1206,14 @@ mod tests {
     fn with_require_approval_off_there_is_no_sign_in() {
         let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
         let mut a = HashMap::new();
-        let plan = decide(false, DAY, 0.0, &keyward, &mut a, NOW);
+        let plan = decide(false, DAY, 0.0, false, &keyward, &mut a, NOW);
         assert_eq!(plan.reach, Reach::Place(keyward.clone()));
         assert_eq!(plan.window, 0.0, "nothing is held");
         assert_eq!(plan.signing_in, None);
         opened(&mut a, &plan, NOW);
         assert!(a.is_empty());
 
-        let windowed = decide(false, DAY, 300.0, &keyward, &mut a, NOW);
+        let windowed = decide(false, DAY, 300.0, false, &keyward, &mut a, NOW);
         assert_eq!((windowed.reach, windowed.window), (Reach::Place(keyward), 300.0));
     }
 
@@ -914,13 +1226,13 @@ mod tests {
         let frizz = scope("/src/frizz", "github.com", "git@github.com:me/frizz.git");
         let mut a = HashMap::new();
 
-        let first = decide(true, 0.0, 300.0, &keyward, &mut a, NOW);
-        assert_eq!((first.signing_in.as_deref(), first.unlock_reuse), (None, 300.0));
+        let first = decide(true, 0.0, 300.0, false, &keyward, &mut a, NOW);
+        assert_eq!((first.signing_in.clone(), first.unlock_reuse), (None, 300.0));
         opened(&mut a, &first, NOW);
-        assert!(decide(true, 0.0, 300.0, &keyward, &mut a, NOW + 10.0).live);
-        assert!(!decide(true, 0.0, 300.0, &frizz, &mut a, NOW + 10.0).live);
+        assert!(decide(true, 0.0, 300.0, false, &keyward, &mut a, NOW + 10.0).live);
+        assert!(!decide(true, 0.0, 300.0, false, &frizz, &mut a, NOW + 10.0).live);
 
-        let every_time = decide(true, 0.0, 0.0, &keyward, &mut HashMap::new(), NOW);
+        let every_time = decide(true, 0.0, 0.0, false, &keyward, &mut HashMap::new(), NOW);
         assert_eq!((every_time.window, every_time.live), (0.0, false));
     }
 
@@ -929,7 +1241,7 @@ mod tests {
     fn a_nonsense_length_is_no_sign_in() {
         let keyward = scope("/src/keyward", "github.com", "git@github.com:me/keyward.git");
         for secs in [-1.0, f64::NAN] {
-            let plan = decide(true, secs, 0.0, &keyward, &mut HashMap::new(), NOW);
+            let plan = decide(true, secs, 0.0, false, &keyward, &mut HashMap::new(), NOW);
             assert_eq!((plan.reach, plan.window), (Reach::Place(keyward.clone()), 0.0), "{secs}");
         }
     }
@@ -938,7 +1250,7 @@ mod tests {
     #[test]
     fn an_unreadable_clock_asks() {
         let mut a = approved(&[(&Reach::Everywhere, NOW)]);
-        let plan = decide(true, DAY, 0.0, &Scope::default(), &mut a, f64::NAN);
+        let plan = decide(true, DAY, 0.0, false, &Scope::default(), &mut a, f64::NAN);
         assert!(!plan.live);
         assert!(plan.signing_in.is_some());
     }

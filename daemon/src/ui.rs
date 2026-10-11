@@ -49,8 +49,9 @@ struct Show<'a> {
     stat: Option<String>,
     /// For a push: the remote-tracking ref the range was computed against; None means a new branch.
     upstream: Option<String>,
-    /// Set on the request that signs in: how long the sign-in lasts ("24 hours").
-    /// Approving it covers every later request, so the card has to say so.
+    /// Set on the request that signs in: when the sign-in ends ("for 6 hours",
+    /// "for 6 hours or until the screen locks"). Approving it covers every later request, so the
+    /// card has to say so.
     sign_in: Option<&'a str>,
 }
 

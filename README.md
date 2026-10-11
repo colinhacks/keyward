@@ -86,7 +86,7 @@ noticed, because `KeepAlive.Crashed` only sees a process that died.
   ],
   "timeout_secs": 10,
   "max_log_bytes": 33554432,
-  "sign_in_secs": 86400
+  "sign_in_secs": 21600
 }
 ```
 
@@ -155,13 +155,13 @@ the allow-list deliberately, never by dumping the environment.
 Keyward can own a Secure Enclave key instead of proxying to Secretive:
 
 ```sh
-keywardd --generate-key --policy presence   # or: biometry, none
+keywardd --generate-key --policy sign-in    # or: presence, biometry, none
 keywardd --pubkey                           # the authorized_keys line
 ```
 
 The private scalar is generated inside the SEP and never leaves it. What lands
-on disk (`enclave-key.blob`, mode 600) is a 324-byte SEP-wrapped handle that is
-inert on any other machine.
+on disk (`enclave-key.blob`, mode 600) is a SEP-wrapped handle that is inert on
+any other machine.
 
 **Why bother, when Secretive already does this.** Because the agent that
 performs the signature is the one that writes the authentication prompt. A
@@ -175,9 +175,10 @@ the request is for, so the prompt reads:
 
 | policy | the enclave asks | signs while the screen is locked | survives a fingerprint change |
 |---|---|---|---|
+| `sign-in` | Touch ID, password fallback, once per sign-in | no | yes |
 | `none` | never | yes | yes |
-| `presence` | Touch ID, password fallback | no | yes |
-| `biometry` | Touch ID only | no | **no — the key is destroyed** |
+| `presence` | Touch ID, password fallback, again about every ten minutes | no | yes |
+| `biometry` | Touch ID only, again about every ten minutes | no | **no — the key is destroyed** |
 
 The daemon asks on its own as well: a request that arrives with no live sign-in (below) raises Touch ID whatever the key's policy. `"require_approval": false` in the config turns that off, and with a `none` key nothing asks at all, so agents can push while you are away. A `presence` or `biometry` key is created usable only while the Mac is unlocked, and refuses every signature on a locked screen with `-25308`; a `none` key is created usable after the first unlock, because unattended signing is what it is for.
 
@@ -187,8 +188,18 @@ Secretive's key is bound to the SEP *and* to Secretive's team identity via the
 keychain, so another program cannot use it even with full file access. Keyward's
 handle is bound to the SEP only, because the keychain route needs an Apple
 signing certificate. Anything running as you that can read the blob can ask the
-enclave to sign — which is why `presence` or `biometry` matters: with those, a
-silent background signature is impossible.
+enclave to sign — which is why `sign-in`, `presence` or `biometry` matters: with
+those the enclave wants a Touch ID first.
+
+It does not have to be a Touch ID that Keyward asked for. A program with a copy of
+the blob can raise a sheet of its own, under any text it likes. (macOS also lets an
+app ask to reuse a Touch ID unlock of the Mac for up to five minutes,
+`touchIDAuthenticationAllowableReuseDuration`; whether that gets past an enclave
+key's own check with no sheet at all has not been established here.) What one Touch
+ID buys depends on the key: about ten minutes of signatures from a `presence` or
+`biometry` key, and from a `sign-in` key the secret it signs for, which is good for
+as long as the key exists. None of it passes through Keyward, so none of it is in the
+log.
 
 It remains far stronger than an on-disk private key. The key cannot be stolen;
 an attacker has to stay resident on this Mac.
@@ -197,7 +208,9 @@ With a signing certificate, the keychain route is open here too: set
 `"enclave_key": "keychain"` in the config before `--generate-key`, and the handle is
 stored in the login keychain as an item only keywardd's own code signature can read
 without a prompt. That is the setting that makes a `none` key reasonable: nothing gets
-to the key except through the daemon, so the daemon's sign-in (below) is the gate.
+to the key except through the daemon, so the daemon's sign-in (below) is the gate. It
+closes the gap above for the other kinds as well, because no other program has the
+blob to ask with.
 
 ### There is no backup
 
@@ -220,8 +233,8 @@ returns "export not implemented for key". The `toid` attribute is the right size
 different key**, which signs successfully and is therefore easy to mistake for
 success. Check the public key, not the error code.
 
-So `kwse.swift` is about eighty lines compiled to a static archive by `build.rs`
-and linked into the daemon. There is no second process and no shipped dylib —
+So `kwse.swift` is compiled to a static archive by `build.rs` and linked into the
+daemon. There is no second process and no shipped dylib —
 the Swift runtime lives in `/usr/lib/swift` on every macOS.
 
 ## The authentication prompt
@@ -241,20 +254,23 @@ git push to owner/repo · Ghostty
 
 ## Signing in
 
-Keyward's own check asks once a day. The first request for its own key raises Touch ID, and that
-sign-in covers every signature with that key for the next 24 hours — any repository,
+Keyward's own check asks once every six hours. The first request for its own key raises Touch ID, and that
+sign-in covers every signature with that key for the next six hours — any repository,
 any host, any agent — so work spread across a dozen checkouts costs one prompt rather
 than one per place. The sheet names the grant before the request that happened to
 raise it, and the card's first row says the same:
 
 ```
-Sign in for 24 hours · git push to owner/repo
+Sign in for 6 hours · git push to owner/repo
 ```
+
+A `sign-in` key's sign-in also ends when the screen locks. Its sheet says that
+instead, `Sign in until screen lock · git push to owner/repo`, and the card says both.
 
 A key held by an upstream agent is that agent's to guard, and prompts the way it
 always did.
 
-`sign_in_secs` (config, 86400 by default) sets how long it lasts. The time runs from
+`sign_in_secs` (config, 21600 by default) sets how long it lasts. The time runs from
 the sign-in itself, on a clock that keeps counting while the Mac sleeps, and the
 signatures that ride it do not extend it. The first request after it runs out signs in
 again.
@@ -271,8 +287,9 @@ launchctl kickstart -k "gui/$(id -u)/dev.danielsol.keyward.agent"
 ```
 
 It is the daemon's own check, so `"require_approval": false` leaves nothing to sign in
-to. Underneath it is one `LAContext`, authenticated explicitly and held for as long as
-the sign-in lasts. Signing in always asks: macOS can let a Touch ID unlock of the Mac
+to. Underneath, for a `none`, `presence` or `biometry` key, it is one `LAContext`,
+authenticated explicitly and held for as long as the sign-in lasts; a `sign-in` key
+holds a secret instead (below). Signing in always asks: macOS can let a Touch ID unlock of the Mac
 in the last five minutes answer a prompt without showing it
 (`touchIDAuthenticationAllowableReuseDuration`), and a sign-in does not use that.
 `sheet_reason` in the config replaces the request on the sheet, never the sign-in.
@@ -284,10 +301,51 @@ raises the enclave's own prompt, which names that request and says nothing of a
 sign-in, and the event is logged as `reused` because the daemon did not ask. Measured
 on macOS 26.6: signatures 9m47s and 8m00s after an authentication were silent, ones
 11m41s and 10m09s after were asked, and the silent signatures in between did not
-extend it. Only a `none` key gets one prompt a day.
+extend it. A `none` key gets one prompt per sign-in, because nothing but the daemon guards
+it. A `sign-in` key gets one and keeps the enclave's guard.
+
+### The sign-in key
+
+`--policy sign-in` makes two enclave keys and keeps them in one handle.
+
+- The **signing key** has no Touch ID requirement. Instead the enclave uses it only
+  for a caller that presents a secret.
+- The **unlock key** does require Touch ID, and all it ever does is reproduce that
+  secret, by key agreement with a pair whose private half was thrown away when the key
+  was made.
+
+Signing in is one Touch ID on the unlock key. The daemon holds the secret it releases,
+in memory, and every signature after that presents it. Nothing is re-authenticated, so
+there is no ten minutes to run out. `--generate-key` signs in once with the new key
+before it keeps it, so making one costs a Touch ID: a key that could never be opened is
+found out there, and not after it has been authorised everywhere.
+
+**The secret is the same for as long as the key exists.** A copy of the handle signs
+nothing by itself: the signing key refuses without the secret, and the secret leaves
+the enclave only behind a Touch ID. But whoever gets that one Touch ID has the secret
+for good, where a `presence` key would have given them ten minutes, and nothing takes
+it back short of making a new key. The trade-off above says how a program on this Mac
+can come by one. `build.sh` signs the daemon with the hardened runtime, so that a
+debugger cannot attach and read the secret out of it while somebody is signed in.
+
+**A sign-in key's sign-in ends when the screen locks**, as well as after
+`sign_in_secs`, and nothing is signed while it is locked. The daemon looks at the
+screen once a second, and again before and after every signature. On anything but an
+unlocked screen at the console it drops the secret and refuses without raising a
+sheet, and a signature already made when the lock arrived is thrown away. Three
+seconds or more between two looks means the Mac slept, and that signs out as well,
+because a lock can hide in a sleep. What can go unseen is a lock undone inside the
+second between two looks, with no request during it. The first request after unlocking signs in again,
+and its sheet reads `Sign in until screen lock · …`. Both keys are also created usable
+only while the Mac is unlocked, so the enclave refuses on its own account too.
+
+`keywardd.log` gets a line whenever the screen changes and whenever somebody is signed
+out. A refused request's event says which it was: `screen locked`, `not at the
+console`, `screen state unreadable`, or `signed out while signing` when the sign-out
+landed under the Touch ID sheet.
 
 A config that fails to parse runs on the defaults without the sign-in, asking for
-every signature, so a typo cannot turn into a day's grant.
+every signature, so a typo cannot turn into a six-hour grant.
 
 ### Approving place by place instead
 
@@ -337,7 +395,7 @@ otherwise.
 ### First run
 
 ```sh
-keywardd --generate-key --policy presence   # once; cannot be undone or backed up
+keywardd --generate-key --policy sign-in    # once; cannot be undone or backed up
 keywardd --pubkey                           # authorise this on your servers
 ```
 

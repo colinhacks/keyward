@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use upstream::Upstream;
@@ -81,9 +81,9 @@ fn default_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
-/// A day.
+/// Six hours.
 fn default_sign_in() -> f64 {
-    86400.0
+    21600.0
 }
 fn default_max_log() -> u64 {
     32 * 1024 * 1024
@@ -143,7 +143,7 @@ fn load_config(path: Option<&str>) -> Config {
         Ok(s) => match serde_json::from_str::<Config>(&s) {
             Ok(c) => c,
             // A file that cannot be read may have been asking for something stricter
-            // than the defaults, so it does not get the day-long sign-in: every
+            // than the defaults, so it does not get the sign-in: every
             // signature asks until it is fixed.
             Err(e) => {
                 eprintln!(
@@ -279,7 +279,7 @@ fn main() {
                 match enclave::Policy::parse(&v) {
                     Some(p) => policy = p,
                     None => {
-                        eprintln!("keywardd: --policy must be none, presence or biometry");
+                        eprintln!("keywardd: --policy must be none, presence, biometry or sign-in");
                         std::process::exit(2);
                     }
                 }
@@ -287,7 +287,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "keywardd [--config PATH]\n                       --health                    probe the socket, non-zero if unanswered\n                       --generate-key              create a Secure Enclave key (once)\n                       --policy none|presence|biometry   auth required per signature\n                       --pubkey                    print the authorized_keys line\n                       --force                     allow overwriting an existing key"
+                    "keywardd [--config PATH]\n                       --health                    probe the socket, non-zero if unanswered\n                       --generate-key              create a Secure Enclave key (once)\n                       --policy none|presence|biometry|sign-in   what a signature costs\n                       --pubkey                    print the authorized_keys line\n                       --force                     allow overwriting an existing key"
                 );
                 return;
             }
@@ -365,6 +365,8 @@ fn main() {
         require_approval: cfg.require_approval,
         sheet_reason: cfg.sheet_reason.clone(),
         approved: Mutex::new(HashMap::new()),
+        sign_outs: AtomicU64::new(0),
+        looked: Mutex::new(agent::Look::first()),
         sign_gate: Mutex::new(()),
     });
 
@@ -380,6 +382,9 @@ fn main() {
     );
 
     watch_self(cfg.listen.clone(), timeout);
+    if ctx.enclave.as_ref().is_some_and(|e| e.ends_at_lock) {
+        agent::watch_screen(Arc::clone(&ctx));
+    }
 
     for stream in listener.incoming() {
         match stream {
@@ -395,7 +400,7 @@ mod tests {
 
     /// Turning the sign-in off is one line, and that line has to be allowed to be
     /// the whole file: when a missing `listen` failed the parse, the daemon fell
-    /// back to its defaults and the day-long sign-in the file had just declined.
+    /// back to its defaults and the sign-in the file had just declined.
     #[test]
     fn a_config_may_set_one_thing_and_leave_the_rest() {
         let cfg: Config = serde_json::from_str(r#"{"sign_in_secs": 0}"#).unwrap();
@@ -404,6 +409,6 @@ mod tests {
         assert!(cfg.require_approval);
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.sign_in_secs, 86400.0, "a day, unless the file says otherwise");
+        assert_eq!(cfg.sign_in_secs, 21600.0, "six hours, unless the file says otherwise");
     }
 }

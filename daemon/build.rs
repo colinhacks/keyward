@@ -18,7 +18,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=kwse");
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
     println!("cargo:rustc-link-arg=-L/usr/lib/swift");
-    for f in ["CryptoKit", "LocalAuthentication", "Security", "Foundation"] {
+    for f in ["CryptoKit", "LocalAuthentication", "Security", "Foundation", "IOKit"] {
         println!("cargo:rustc-link-lib=framework={f}");
     }
     for l in ["swiftCore", "swiftFoundation", "swiftDarwin", "swiftObjectiveC", "objc"] {
